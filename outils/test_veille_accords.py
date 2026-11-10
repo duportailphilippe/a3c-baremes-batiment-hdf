@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Régressions de veille A3C V18 (incluant les acquis V17), sans accès Internet.
+"""Régressions de veille A3C V19 (incluant les acquis V17), sans accès Internet.
 
 Les extraits de chiffres de 2024, 2025, 2026 correspondent aux textes de
 Légifrance ; les enveloppes XML de tests sont synthétiques.
@@ -163,7 +163,7 @@ class TestVeilleV17(unittest.TestCase):
             requete.assert_not_called()
 
 
-class TestVeilleV18(unittest.TestCase):
+class TestVeilleV19(unittest.TestCase):
     """Contrôles indépendants des sources, sur archives synthétiques hors ligne."""
 
     def test_index_bocc_classe_par_date_de_publication(self):
@@ -181,26 +181,24 @@ class TestVeilleV18(unittest.TestCase):
         self.assertTrue(x['temoin_2026_present'])
         self.assertEqual(x['nombre_total'], 1)
 
-    def test_jorf_temoignage_document_officiel(self):
-        html = '''<html><body><h1>Arrêté du 22 octobre 2026</h1>
-        JORF n°0255 du 31 octobre 2026. Arrêté portant extension
-        Hauts-de-France des entreprises du bâtiment.
-        Article 3 : sont rendues obligatoires les stipulations de l'accord régional
-        du 10 juillet 2026 relatif aux indemnités de petits déplacements.</body></html>'''
-        x = v.controle_temoin_jorf_2026(lecture=lambda _: html)
-        self.assertEqual(x['etat'], 'confirme_sur_page_legifrance')
-        self.assertTrue(x['preuve_texte'])
+    def test_detection_extension_sans_identifiant_preinscrit(self):
+        t = JORF.replace('JORFTEXT000055037883', '')
+        self.assertEqual(v.accords_etendus_dans_texte(t), [
+            {'date_signature': '2026-07-10', 'objet': 'indemnites_de_petits_deplacements'}])
 
-    def test_jorf_temoignage_lien_seul_ne_prouve_rien(self):
-        x = v.controle_temoin_jorf_2026(lecture=lambda _: '<html>Page vide</html>')
-        self.assertEqual(x['etat'], 'contenu_insuffisant')
-        self.assertFalse(x['preuve_texte'])
+    def test_refus_de_conclure_a_partir_de_simple_date(self):
+        t = 'Arrêté extension Hauts-de-France ouvriers bâtiment IDCC 1596 du 10 juillet 2026 relatif aux salaires.'
+        self.assertEqual(v.accords_etendus_dans_texte(t), [])
 
-    def test_jorf_temoignage_echec_reseau_identifie(self):
-        def erreur(_):
-            raise OSError('Accès impossible')
-        x = v.controle_temoin_jorf_2026(lecture=erreur)
-        self.assertEqual(x['etat'], 'consultation_impossible')
+    def test_jour_de_publication_lu_dans_metadonnees(self):
+        contenu = b'<JORF><META><DATE_PUBLI>2026-10-31</DATE_PUBLI></META></JORF>'
+        self.assertEqual(v.date_publication_xml(contenu), '2026-10-31')
+        self.assertIsNone(v.date_publication_xml(b'<JORF><DATE>2026-10-31</DATE></JORF>'))
+
+    def test_temoignage_reel_non_pretendu_sans_archive_jorf(self):
+        statut = v.bilan_jorf_temoins([], [])['extension_accord_10_juillet_2026']
+        self.assertEqual(statut['etat'], 'non_evaluable_sans_archive_historique')
+        self.assertFalse(statut['preuve_archive_xml'])
 
     def test_jorf_extension_cible_parmi_salaires(self):
         self.assertEqual(v.qualification_texte_jorf(JORF), 'extension_deplacements_a_controler')
@@ -265,16 +263,105 @@ class TestVeilleV18(unittest.TestCase):
                 avant = referentiel.read_bytes()
                 resultat = v.execution(['--mode', 'retroactif', '--rapport', str(rapport),
                         '--archive-kali-locale', p1, '--archive-jorf-locale', p2,
-                        '--archive-bocc-locale', p3, '--sans-temoin-web'])
+                        '--archive-bocc-locale', p3])
                 self.assertEqual(resultat, 0)
                 donnees = json.loads(rapport.read_text(encoding='utf-8'))
-                self.assertEqual(donnees['version'], '18.0')
+                self.assertEqual(donnees['version'], '19.0')
                 self.assertEqual(len(donnees['archives']), 3)
                 self.assertFalse(donnees['baremes_modifies'])
                 self.assertEqual(avant, referentiel.read_bytes())
                 self.assertTrue(any(d['famille'] == 'JORF' for d in donnees['documents']))
+                self.assertEqual(donnees['temoins_jorf']['extension_accord_10_juillet_2026']['etat'], 'correspondance_xml_locale_a_authentifier')
         finally:
             a1.cleanup(); a2.cleanup(); a3.cleanup()
+
+
+class TestRetrospectifEtPersistantV19(unittest.TestCase):
+    def test_index_jorfsimple_et_exclusion_stock_massif(self):
+        html = ('<a href="Freemium_jorf_simple_20261108-140000.tar.gz">stock</a>'
+                '<a href="JORFSIMPLE_20261109-212854.tar.gz">flux</a>')
+        trouve = v.archives_disponibles(html, 'JORFSIMPLE')
+        self.assertEqual(len(trouve['quotidiens']), 1)
+        self.assertIsNone(trouve['global'])
+        self.assertTrue(trouve['quotidiens'][0].startswith(v.SOURCE_JORFSIMPLE))
+
+    def test_journal_officiel_31_octobre_XML_synthetique(self):
+        texte = ('''Arrêté du 22 octobre 2026 portant extension d'accords régionaux Hauts-de-France
+        des ouvriers du bâtiment (n° 1596 et 1597). Article 3 : sont rendues obligatoires
+        les stipulations de l'accord régional (Hauts-de-France) du 10 juillet 2026 relatif
+        aux indemnités de petits déplacements.''')
+        bloc = ('''<JORF><META><ID>JORFTEXT000055037883</ID><DATE_PUBLI>2026-10-31</DATE_PUBLI>
+        <TITREFULL>Arrêté du 22 octobre 2026 portant extension d’accords régionaux (Hauts-de-France)</TITREFULL></META>
+        <CONTENU>''' + texte + '''</CONTENU></JORF>''').encode('utf-8')
+        dossier, chemin = archive_temporaire({'jorf/JORFTEXT000055037883.xml': bloc})
+        try:
+            res = v.analyser_archive(chemin, 'JORFSIMPLE', 'archive XML artificielle pour test')
+            self.assertEqual(len(res['groupes']), 1)
+            doc = res['groupes'][0]
+            self.assertEqual(doc['date_publication_xml'], '2026-10-31')
+            self.assertEqual(doc['accords_vises'][0]['date_signature'], '2026-07-10')
+            self.assertEqual(v.bilan_jorf_temoins(res['groupes'], [res])['extension_accord_10_juillet_2026']['etat'], 'correspondance_xml_locale_a_authentifier')
+            self.assertEqual(doc['famille'], 'JORFSIMPLE')
+        finally:
+            dossier.cleanup()
+
+    def test_plusieurs_accords_ne_pas_faussement_associer(self):
+        texte = ('''Arrêté d'extension Hauts-de-France ouvriers bâtiment 1596 1597.
+        Vu l'accord régional (Hauts-de-France) du 10 juillet 2026 relatif aux salaires.
+        Vu l'accord régional (Hauts-de-France) du 12 décembre 2026 relatif aux indemnités de petits déplacements.
+        Arrête : les accords sont rendus obligatoires.''')
+        extraits = v.accords_etendus_dans_texte(texte)
+        self.assertEqual([r['date_signature'] for r in extraits], ['2026-12-12'])
+
+    def test_archive_journal_reconnue_sans_reference_legifrance(self):
+        t = JORF.replace('JORFTEXT000055037883', '')
+        doc = v.donnees_xml(xml('Arrêté du 22 octobre 2026 portant extension Hauts-de-France', t, 'X'))
+        self.assertTrue(v.est_extension_cible(*doc))
+
+    def test_etat_ajout_et_non_duplication(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            fichier = Path(d) / 'suivi' / 'etat.json'
+            etat = v.charger_etat(str(fichier))
+            v.enregistrer_archive(etat, 'JORFSIMPLE', v.SOURCE_JORFSIMPLE + 'JORFSIMPLE_20261110-002231.tar.gz')
+            v.enregistrer_archive(etat, 'JORFSIMPLE', v.SOURCE_JORFSIMPLE + 'JORFSIMPLE_20261110-002231.tar.gz')
+            self.assertEqual(len(etat['archives_traitees']['JORFSIMPLE']), 1)
+            self.assertEqual(etat['derniere_date_jorf'], '2026-11-10')
+            fichier.parent.mkdir(parents=True, exist_ok=True)
+            fichier.write_text(json.dumps(etat), encoding='utf-8')
+            self.assertEqual(v.charger_etat(str(fichier))['derniere_date_jorf'], '2026-11-10')
+
+    def test_rupture_de_couverture_signalee(self):
+        ancien = {'derniere_date_jorf': '2026-11-04'}
+        liens = [v.SOURCE_JORFSIMPLE + 'JORFSIMPLE_20261109-212854.tar.gz']
+        self.assertIn('RUPTURE DE COUVERTURE', v.ecarts_de_couverture(ancien, liens)[0])
+        self.assertEqual(v.ecarts_de_couverture({'derniere_date_jorf': '2026-11-08'}, liens), [])
+
+    def test_ticket_lacune_explicitement_non_accord(self):
+        titre = v.description_ticket({'famille': 'CONTROLE', 'extrait': 'Rupture de couverture'})
+        self.assertIn('ne signale pas un nouvel accord', titre)
+        self.assertIn('Rupture de couverture', titre)
+
+    def test_jamais_de_date_extraite_d_un_fichier_de_telechargement(self):
+        self.assertIsNone(v.date_publication_xml(b'<JORF><NOM>JORFSIMPLE_20261031-002231.tar.gz</NOM></JORF>'))
+
+    def test_ne_publie_jamais_les_baremes(self):
+        with tempfile.TemporaryDirectory() as d:
+            baremes = Path(d) / 'baremes.json'
+            baremes.write_text('{"records": []}', encoding='utf-8')
+            original = baremes.read_bytes()
+            source, chemin = archive_temporaire({'j.xml': xml('Arrêté portant extension Hauts-de-France', JORF, 'JORFTEXT000055037883')})
+            try:
+                with patch.object(v, 'lire_index', return_value='<html></html>'):
+                    rapport = Path(d) / 'rapport.json'
+                    code = v.execution(['--mode', 'retroactif', '--archive-jorfsimple-locale', chemin,
+                                        '--archive-kali-locale', chemin, '--archive-bocc-locale', chemin,
+                                        '--rapport', str(rapport)])
+                # KALI et BOCC n'ont pas de grilles pertinentes ; la preuve JORF lue suffit.
+                self.assertEqual(code, 0)
+                self.assertEqual(baremes.read_bytes(), original)
+            finally:
+                source.cleanup()
 
 
 if __name__ == '__main__':
