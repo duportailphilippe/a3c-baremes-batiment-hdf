@@ -1,0 +1,20 @@
+{
+  "version": "19.0",
+  "archives_traitees": {
+    "KALI": [
+      "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261109-212854.tar.gz"
+    ],
+    "JORFSIMPLE": [
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261108-210452.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261109-212854.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261110-002231.tar.gz"
+    ],
+    "BOCC": [
+      "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260032.complet.taz",
+      "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260034.complet.taz",
+      "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260035.complet.taz",
+      "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260036.complet.taz"
+    ]
+  },
+  "derniere_date_jorf": "2026-11-10"
+}
