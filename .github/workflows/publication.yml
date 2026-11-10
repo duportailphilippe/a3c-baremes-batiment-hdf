@@ -1,0 +1,53 @@
+name: Contrôler et publier le référentiel A3C
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'baremes.json'
+      - 'index.html'
+      - 'outils/verifier_baremes.py'
+      - '.github/workflows/publication.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: publication-referentiel-a3c
+  cancel-in-progress: false
+
+jobs:
+  controle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer les fichiers
+        uses: actions/checkout@v4
+      - name: Vérifier le format des barèmes
+        run: python3 outils/verifier_baremes.py baremes.json
+
+  publication:
+    needs: controle
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploiement.outputs.page_url }}
+    steps:
+      - name: Récupérer les fichiers
+        uses: actions/checkout@v4
+      - name: Préparer les fichiers publics
+        run: |
+          mkdir -p site
+          cp baremes.json index.html site/
+          touch site/.nojekyll
+      - name: Configurer GitHub Pages
+        uses: actions/configure-pages@v5
+      - name: Charger les fichiers validés
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - name: Publier GitHub Pages
+        id: deploiement
+        uses: actions/deploy-pages@v4
