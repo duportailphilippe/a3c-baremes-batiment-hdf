@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Veille officielle DILA/KALI des petits déplacements Bâtiment HDF.
+"""Veille A3C V17 — DILA/KALI et JORF, sans modification de baremes.json.
 
-Ne modifie JAMAIS baremes.json. Sur une nouvelle publication potentiellement
-pertinente, crée un ticket GitHub pour vérification juridique.
-
-Ce programme lit l'index et les archives KALI diffusés par la DILA. Il ne
-prétend pas garantir une recherche exhaustive des arrêtés d'extension au JORF.
+- Quotidien : complément KALI le plus récent + derniers compléments JORF disponibles.
+- Complet / rétroactif : archive KALI globale + derniers JORF (jamais JORF global, 1,6 Go).
+- Regroupe les articles d'un même accord, reconstitue des barèmes seulement si non ambigus.
+- Signale les arrêtés d'extension pour validation juridique.
+- Les montants extraits sont des PROPOSITIONS. Le simulateur n'est jamais mis à jour.
 """
 from __future__ import annotations
 
 import argparse
-import datetime as dt
+from collections import defaultdict
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import hashlib
-import html
+from html import unescape
 from html.parser import HTMLParser
-import io
 import json
 import os
 from pathlib import Path
@@ -25,336 +26,520 @@ import tarfile
 import tempfile
 import unicodedata
 from urllib.error import HTTPError, URLError
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 
-ADRESSE_SOURCE = "https://echanges.dila.gouv.fr/OPENDATA/KALI/"
-AGENT = "A3C-Veille-KALI/1.0 (utilisation professionnelle; contact par dépôt GitHub)"
-DUREE_RESEAU = 40
-TAILLE_MAX_ARCHIVE = 320_000_000
-TAILLE_MAX_XML = 8_000_000
-LIMITE_TICKETS = 12
-# Le simulateur local possède déjà les barèmes connus jusqu'à l'accord du
-# 10 juillet 2026. Les archives globales contiennent beaucoup de textes anciens.
-DATE_DERNIER_ACCORD_CONNU = dt.date(2026, 7, 10)
-MOIS = {
-    'janvier': 1, 'fevrier': 2, 'mars': 3, 'avril': 4, 'mai': 5,
-    'juin': 6, 'juillet': 7, 'aout': 8, 'septembre': 9,
-    'octobre': 10, 'novembre': 11, 'decembre': 12,
+SOURCE_KALI = 'https://echanges.dila.gouv.fr/OPENDATA/KALI/'
+SOURCE_JORF = 'https://echanges.dila.gouv.fr/OPENDATA/JORF/'
+AGENT = 'A3C-Veille-Accords/17 (veille juridique; depot GitHub a3c-baremes-batiment-hdf)'
+LIMITE_KALI = 340_000_000
+LIMITE_JORF = 125_000_000  # Les JORF globaux sont volontairement exclus
+LIMITE_XML = 6_000_000
+LIMITE_ALERTES = 12
+DERNIER_ACCORD_CONNU = '2026-07-10'
+# Témoins historiques non utilisés pour publier un barème, seulement pour tester le moteur.
+TEMOINS = {
+    '2024-11-25': {'repas': '14.00', 'transport': ['2.68','6.38','9.86','12.96','16.57'], 'trajet': ['1.55','3.11','4.66','6.22','7.78']},
+    '2025-12-01': {'repas': '14.00', 'transport': ['2.71','6.44','9.96','13.09','16.74'], 'trajet': ['1.57','3.14','4.71','6.28','7.86']},
+    '2026-07-10': {'repas': '14.00', 'transport': ['2.76','6.56','10.14','13.33','17.04'], 'trajet': ['1.57','3.14','4.71','6.28','7.86']},
 }
-
-
-def est_accord_deja_connu(titre: str) -> bool:
-    """Écarte seulement les accords anciens explicitement datés dans leur titre."""
-    t = normaliser(titre)
-    m = re.search(r'accord du (1er|[0-3]?\d) (janvier|fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|novembre|decembre) (20\d{2})', t)
-    if not m:
-        return False
-    try:
-        jour = 1 if m.group(1) == '1er' else int(m.group(1))
-        date = dt.date(int(m.group(3)), MOIS[m.group(2)], jour)
-    except (ValueError, KeyError):
-        return False
-    return date <= DATE_DERNIER_ACCORD_CONNU
+MOIS = {'janvier': 1, 'fevrier': 2, 'mars': 3, 'avril': 4, 'mai': 5, 'juin': 6,
+        'juillet': 7, 'aout': 8, 'septembre': 9, 'octobre': 10, 'novembre': 11, 'decembre': 12}
+EUROS = r'(\d{1,3}(?:[\s\u00a0]\d{3})*(?:[.,]\d{1,2})?)\s*(?:€|euros?)?'
+ZONES = r'\bzone\s*(?:n[°o]\s*)?([1-5])\b'
 
 
 def normaliser(texte: str) -> str:
-    sans_accents = ''.join(c for c in unicodedata.normalize('NFKD', texte)
-                           if not unicodedata.combining(c))
-    return re.sub(r'\s+', ' ', sans_accents.lower()).strip()
+    texte = ''.join(c for c in unicodedata.normalize('NFKD', texte) if not unicodedata.combining(c))
+    return re.sub(r'\s+', ' ', texte.lower().replace('\u00a0', ' ')).strip()
 
 
-class LecteurLiens(HTMLParser):
+class Liens(HTMLParser):
     def __init__(self):
         super().__init__()
-        self.liens: list[str] = []
+        self.liens = []
 
-    def handle_starttag(self, balise, attributs):
-        if balise == 'a':
-            adresse = dict(attributs).get('href', '')
-            if adresse:
-                self.liens.append(adresse)
-
-
-def repertoire_officiel(html_index: str) -> dict[str, str]:
-    """Prend le dernier complément KALI et, si disponible, l'archive globale."""
-    lecteur = LecteurLiens()
-    lecteur.feed(html_index)
-    complement = []
-    globales = []
-    for lien in lecteur.liens:
-        nom = lien.rsplit('/', 1)[-1]
-        if re.fullmatch(r'KALI_\d{8}-\d{6}\.tar\.gz', nom):
-            complement.append(nom)
-        elif re.fullmatch(r'Freemium_kali_global_\d{8}-\d{6}\.tar\.gz', nom, re.I):
-            globales.append(nom)
-    if not complement and not globales:
-        raise ValueError('Aucune archive KALI reconnue dans le répertoire officiel DILA.')
-    resultat = {}
-    if complement:
-        resultat['quotidien'] = urljoin(ADRESSE_SOURCE, max(complement))
-    if globales:
-        resultat['complet'] = urljoin(ADRESSE_SOURCE, max(globales))
-    return resultat
+    def handle_starttag(self, nom, attributs):
+        if nom == 'a':
+            valeur = dict(attributs).get('href')
+            if valeur:
+                self.liens.append(valeur)
 
 
-def ouvrir(adresse: str):
-    requete = Request(adresse, headers={'User-Agent': AGENT, 'Accept': '*/*'})
-    return urlopen(requete, timeout=DUREE_RESEAU)
+def archives_disponibles(index: str, famille: str) -> dict[str, object]:
+    lecteur = Liens()
+    lecteur.feed(index)
+    noms = [url.rsplit('/', 1)[-1] for url in lecteur.liens]
+    if famille == 'KALI':
+        quotidiens = sorted(n for n in noms if re.fullmatch(r'KALI_\d{8}-\d{6}\.tar\.gz', n))
+        globales = sorted(n for n in noms if re.fullmatch(r'Freemium_kali_global_\d{8}-\d{6}\.tar\.gz', n, re.I))
+    elif famille == 'JORF':
+        quotidiens = sorted(n for n in noms if re.fullmatch(r'JORF_\d{8}-\d{6}\.tar\.gz', n))
+        globales = []
+    else:
+        raise ValueError('Famille de données inconnue.')
+    base = SOURCE_KALI if famille == 'KALI' else SOURCE_JORF
+    return {
+        'quotidiens': [urljoin(base, n) for n in quotidiens[-3:]],
+        'global': urljoin(base, globales[-1]) if globales else None,
+    }
 
 
-def lire_index() -> str:
-    with ouvrir(ADRESSE_SOURCE) as reponse:
-        contenu = reponse.read(200_000)
-    return contenu.decode('latin-1', errors='replace')
+def ouvrir(url: str):
+    return urlopen(Request(url, headers={'User-Agent': AGENT}), timeout=75)
 
 
-def telecharger_archive(adresse: str) -> str:
-    """Télécharge l'archive dans un fichier temporaire sans garder les 184 Mo en RAM."""
-    temp = tempfile.NamedTemporaryFile(prefix='a3c_kali_', suffix='.tar.gz', delete=False)
-    taille = 0
+def lire_index(url: str) -> str:
+    with ouvrir(url) as reponse:
+        return reponse.read(250_000).decode('latin-1', errors='replace')
+
+
+def telecharger(url: str, taille_max: int) -> str:
+    fichier = tempfile.NamedTemporaryFile(prefix='a3c_veille_', suffix='.tar.gz', delete=False)
+    volume = 0
     try:
-        with temp, ouvrir(adresse) as reponse:
-            while True:
-                morceau = reponse.read(1_048_576)
-                if not morceau:
-                    break
-                taille += len(morceau)
-                if taille > TAILLE_MAX_ARCHIVE:
-                    raise ValueError('Archive officielle supérieure à la limite de 320 Mo.')
-                temp.write(morceau)
-        if taille < 100:
-            raise ValueError('Archive officielle incomplète.')
-        return temp.name
+        with fichier, ouvrir(url) as entree:
+            while bloc := entree.read(1024 * 1024):
+                volume += len(bloc)
+                if volume > taille_max:
+                    raise ValueError('Taille de l’archive supérieure à la limite de sécurité.')
+                fichier.write(bloc)
+        if volume < 100:
+            raise ValueError('Archive reçue vide ou tronquée.')
+        return fichier.name
     except Exception:
-        Path(temp.name).unlink(missing_ok=True)
+        Path(fichier.name).unlink(missing_ok=True)
         raise
 
 
-def texte_xml(blob: bytes) -> tuple[str, str]:
-    """Texte et titre d'un XML KALI ; extraction de secours sans exécuter de DTD."""
-    titre = ''
+def donnees_xml(blob: bytes) -> tuple[str, str]:
+    """Texte lisible et titre. Ne résout pas de ressources XML externes."""
     try:
         racine = ET.fromstring(blob)
-        for element in racine.iter():
-            nom = element.tag.rsplit('}', 1)[-1].upper() if isinstance(element.tag, str) else ''
-            if nom in ('TITRE_TXT', 'TITRE', 'INTITULE') and (element.text or '').strip():
-                if not titre:
-                    titre = ' '.join(element.text.split())[:240]
-        return ' '.join(racine.itertext()), titre
+        titres = []
+        for el in racine.iter():
+            tag = el.tag.rsplit('}', 1)[-1].upper() if isinstance(el.tag, str) else ''
+            if tag in ('TITRE_TEXTE', 'TITRE_TXT', 'TITRE', 'INTITULE'):
+                valeur = ' '.join(' '.join(el.itertext()).split())
+                if 8 <= len(valeur) <= 350:
+                    titres.append(valeur)
+        titre = next((v for v in titres if 'haut' in normaliser(v) and
+                      ('deplacement' in normaliser(v) or 'accord' in normaliser(v))), '')
+        if not titre:
+            titre = (titres[0] if titres else '')
+        return ' '.join(' '.join(racine.itertext()).split()), titre
     except ET.ParseError:
         brut = blob.decode('utf-8', errors='replace')
-        sans_balises = html.unescape(re.sub(r'<[^>]*>', ' ', brut))
-        return sans_balises, ''
+        return ' '.join(unescape(re.sub(r'<[^>]+>', ' ', brut)).split()), ''
 
 
-def est_pertinent(texte: str) -> bool:
+def date_accord(texte: str) -> str | None:
+    """Date de signature extraite d'un titre ou d'une rédaction d'accord."""
     t = normaliser(texte)
-    region = ('hauts-de-france' in t or 'hauts de france' in t)
-    deplacement = ('deplacement' in t and 'indemnit' in t)
-    petit = 'petits deplacements' in t or 'petit deplacement' in t
-    code = bool(re.search(r'\b(?:idcc\s*[:n°-]?\s*)?(?:1596|1597)\b', t))
-    batiment = 'batiment' in t and ('ouvrier' in t or 'entreprise' in t)
-    # Les textes relatifs exclusivement aux travaux publics sont exclus.
-    tp_seul = 'travaux publics' in t and not batiment and not code
-    return region and deplacement and petit and (code or batiment) and not tp_seul
-
-
-def pre_extraction(texte: str) -> dict:
-    """Indices à valider, JAMAIS convertis directement en barème."""
-    t = normaliser(texte)
-    dates = sorted(set(re.findall(r'\b(?:0?[1-9]|[12]\d|3[01])[/.](?:0?[1-9]|1[0-2])[/.]20\d\d\b', t)))[:16]
-    montants = sorted(set(re.findall(r'\b\d{1,3}(?:[.,]\d{1,2})\s*(?:€|euros?)(?![a-z0-9])', t)))[:30]
-    zones = []
-    for indice in range(1, 6):
-        match = re.search(r'\bzone\s*(?:n[°o]\s*)?' + str(indice) + r'\b(.{0,150})', t)
-        if match:
-            portion = match.group(1).strip()
-            valeurs = re.findall(r'\b\d{1,3}(?:[.,]\d{1,2})\s*(?:€|euros?)(?![a-z0-9])', portion)
-            zones.append({'zone': indice, 'extrait': portion, 'montants_non_attribues': valeurs[:5]})
-    return {'dates_reperees': dates, 'montants_reperes': montants, 'zones': zones}
-
-
-def reference_legifrance(texte: str, chemin: str) -> str | None:
-    source = texte + ' ' + chemin
-    match = re.search(r'KALI(?:TEXT|ARTI)\d{10,}', source, re.I)
-    if not match:
+    motif = (r'\b(?:accord(?:\s+regional)?|avenant(?:\s+n[°o]?\s*\d+)?)\s+du\s+'
+             r'(1er|[0-3]?\d)\s+(' + '|'.join(MOIS) + r')\s+(20\d{2})\b')
+    m = re.search(motif, t)
+    if not m:
         return None
-    identifiant = match.group(0).upper()
-    nature = 'id' if identifiant.startswith('KALITEXT') else 'article'
-    return f'https://www.legifrance.gouv.fr/conv_coll/{nature}/{identifiant}'
+    try:
+        jour = 1 if m.group(1) == '1er' else int(m.group(1))
+        return f'{int(m.group(3)):04d}-{MOIS[m.group(2)]:02d}-{jour:02d}'
+    except ValueError:
+        return None
 
 
-def analyser_archive(chemin: str, adresse_archive: str, limite_resultats=75) -> tuple[list[dict], int]:
-    candidats: list[dict] = []
-    vus: set[str] = set()
-    compte = 0
-    with tarfile.open(chemin, mode='r:gz') as archive:
-        for membre in archive:
-            if not membre.isfile() or not membre.name.lower().endswith('.xml'):
-                continue
-            compte += 1
-            if membre.size > TAILLE_MAX_XML:
-                continue
-            fichier = archive.extractfile(membre)
-            if fichier is None:
-                continue
-            contenu = fichier.read(TAILLE_MAX_XML + 1)
-            texte, titre = texte_xml(contenu)
-            if not est_pertinent(texte):
-                continue
-            if est_accord_deja_connu(titre):
-                continue
-            # Identifiant stable pour éviter les tickets répétés entre flux et archive complète.
-            identifiant = re.search(r'KALI(?:TEXT|ARTI)\d{10,}', texte + ' ' + membre.name, re.I)
-            signature = (identifiant.group(0).upper() if identifiant else membre.name)
-            cle = hashlib.sha256((signature + '|' + normaliser(texte)).encode('utf-8')).hexdigest()[:16]
-            if cle in vus:
-                continue
-            vus.add(cle)
-            resume = ' '.join(texte.split())
-            candidats.append({
-                'cle': cle,
-                'titre': titre or 'Publication KALI potentiellement relative aux indemnités de petits déplacements',
-                'chemin_dans_archive': membre.name,
-                'archive_officielle': adresse_archive,
-                'texte_legifrance': reference_legifrance(texte, membre.name),
-                'indices': pre_extraction(texte),
-                'extrait': resume[:2500],
-            })
-            if len(candidats) >= limite_resultats:
-                break
-    return candidats, compte
+def est_accord_cible(texte: str, titre: str = '') -> bool:
+    t = normaliser(texte + ' ' + titre)
+    hdf = 'hauts-de-france' in t or 'hauts de france' in t
+    objet = 'petits deplacements' in t or 'petit deplacement' in t
+    secteur = (('batiment' in t and ('ouvrier' in t or '1596' in t or '1597' in t))
+               or bool(re.search(r'\b(?:1596|1597)\b', t)))
+    travaux_publics_seuls = ('travaux publics' in t and 'batiment' not in t
+                            and not re.search(r'\b(?:1596|1597)\b', t))
+    return bool(hdf and objet and secteur and not travaux_publics_seuls)
 
 
-def requete_github(adresse: str, jeton: str, methode='GET', donnees: dict | None = None):
-    corps = json.dumps(donnees, ensure_ascii=False).encode('utf-8') if donnees is not None else None
-    requete = Request(adresse, data=corps, method=methode,
-                      headers={'Authorization': f'Bearer {jeton}',
-                               'Accept': 'application/vnd.github+json',
-                               'X-GitHub-Api-Version': '2022-11-28',
-                               'User-Agent': AGENT,
-                               'Content-Type': 'application/json'})
-    with urlopen(requete, timeout=DUREE_RESEAU) as reponse:
-        return json.load(reponse)
+def est_extension_cible(texte: str, titre: str = '') -> bool:
+    t = normaliser(texte + ' ' + titre)
+    if 'extension' not in t or ('arrete' not in t and 'sont rendues obligatoires' not in t):
+        return False
+    if 'travaux publics' in t and 'batiment' not in t and not re.search(r'\b(?:1596|1597)\b', t):
+        return False
+    secteur = 'batiment' in t or bool(re.search(r'\b(?:1596|1597)\b', t))
+    region = 'hauts-de-france' in t or 'hauts de france' in t
+    # Les arrêtés regroupent parfois plusieurs accords (salaires + déplacement).
+    # Retenir l'arrêté régional général si les conventions ciblées sont mentionnées.
+    return bool(secteur and region)
 
 
-def tickets_existants(depot: str, jeton: str) -> set[str]:
-    resultat = set()
-    for page in range(1, 31):
-        liste = requete_github(f'https://api.github.com/repos/{depot}/issues?state=all&per_page=100&page={page}',jeton)
-        if not isinstance(liste, list):
-            raise ValueError('Réponse inattendue de l’API GitHub (tickets).')
-        for ticket in liste:
-            if 'pull_request' not in ticket:
-                cle = re.search(r'\[KALI:([0-9a-f]{16})\]', ticket.get('title', ''))
-                if cle:
-                    resultat.add(cle.group(1))
-        if len(liste) < 100:
-            break
+def euros(nombre: str) -> str | None:
+    try:
+        montant = Decimal(nombre.replace('\u00a0', '').replace(' ', '').replace(',', '.'))
+        if not Decimal('0.01') <= montant <= Decimal('200'):
+            return None
+        return str(montant.quantize(Decimal('0.01')))
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def valeurs_par_zone(texte: str) -> list[str] | None:
+    """Lit cinq entrées 'zone N : X €' sans attribution approximative."""
+    motif = re.compile(ZONES + r'\s*[:=\-]?\s*' + EUROS + r'(?!\s*\d)', re.I)
+    valeurs: dict[int, str] = {}
+    for m in motif.finditer(texte):
+        index = int(m.group(1))
+        montant = euros(m.group(2))
+        if not montant or index in valeurs:
+            return None
+        valeurs[index] = montant
+    if sorted(valeurs) != [1, 2, 3, 4, 5]:
+        return None
+    return [valeurs[n] for n in range(1, 6)]
+
+
+def extraire_grille(texte: str) -> dict:
+    """Propose une grille uniquement si chaque zone et poste sont non ambigus.
+
+    Gère listes 'Indemnité de transport : zone 1 : ...' et tableaux sur une
+    seule ligne 'Zone 1 2,71 € 1,57 €' lorsque l'en-tête transport/trajet est clair.
+    Une grille concernant deux sous-régions ou comportant plusieurs périodes est rejetée.
+    """
+    t = normaliser(texte)
+    resultat = {'etat': 'non_reconstitue', 'raison': 'Tableau incomplet ou ambigu',
+                'repas': None, 'transport': None, 'trajet': None, 'date_effet_proposee': None}
+    # Plusieurs grilles départementales exigent une analyse particulière du territoire.
+    if len(re.findall(r'pour les departements\b', t)) > 1:
+        resultat['raison'] = 'Plusieurs grilles départementales ; affectation manuelle nécessaire'
+        return resultat
+    # La date d'effet doit être explicite ; jamais assimilée à la signature de l'accord.
+    mois = '|'.join(MOIS)
+    matches_dates = re.findall(r'\b(?:au|a compter du|applicable a compter du)\s+'
+                               r'(1er|[0-3]?\d)\s+(' + mois + r')\s+(20\d{2})\b', t)
+    dates = set()
+    for jour, nom, annee in matches_dates:
+        dates.add(f'{int(annee):04d}-{MOIS[nom]:02d}-{1 if jour == "1er" else int(jour):02d}')
+    if len(dates) == 1:
+        resultat['date_effet_proposee'] = next(iter(dates))
+
+    repas = re.findall(r'indemnite\s+de\s+repas.{0,65}?(?:fixee\s+a|est\s+de|:)' \
+                      r'\s*(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:€|euros?)', t)
+    if len(set(repas)) == 1:
+        resultat['repas'] = euros(repas[0])
+
+    # Découpage strict en rubriques, y compris ancien format narratif.
+    transport = re.search(r'indemnite\s+de\s+transport\s*:\s*(.*?)(?=indemnite\s+de\s+trajet\s*:|\bpour\s+les\s+departements\b|$)', t)
+    trajet = re.search(r'indemnite\s+de\s+trajet\s*:\s*(.*?)(?=\bpour\s+les\s+departements\b|\bconvention\s+collective\b|$)', t)
+    if transport and trajet:
+        resultat['transport'] = valeurs_par_zone(transport.group(1))
+        resultat['trajet'] = valeurs_par_zone(trajet.group(1))
+    # Format tableau rédigé en ligne « Indemnité de transport et indemnité de trajet ... Zone 1 X € Y € ».
+    if resultat['transport'] is None or resultat['trajet'] is None:
+        en_tete = re.search(r'indemnite\s+de\s+transport\s+et\s+indemnite\s+de\s+trajet\s*:', t)
+        if en_tete:
+            bloc = t[en_tete.end():]
+            ligne = re.compile(ZONES + r'\s*[:=\-]?\s*' + EUROS + r'\s*(?:€|euros?)?\s*' + EUROS + r'\s*(?:€|euros?)?', re.I)
+            paires = {}
+            for m in ligne.finditer(bloc):
+                z = int(m.group(1))
+                a, b = euros(m.group(2)), euros(m.group(3))
+                if z in paires or not a or not b:
+                    paires = {}
+                    break
+                paires[z] = [a, b]
+            if sorted(paires) == [1, 2, 3, 4, 5]:
+                resultat['transport'] = [paires[z][0] for z in range(1, 6)]
+                resultat['trajet'] = [paires[z][1] for z in range(1, 6)]
+    # Les trois postes sont nécessaires ; les incohérences bloquent toute proposition.
+    if resultat['repas'] and resultat['transport'] and resultat['trajet']:
+        tvals = [Decimal(v) for v in resultat['transport']]
+        jvals = [Decimal(v) for v in resultat['trajet']]
+        if all(tvals[i] < tvals[i + 1] and jvals[i] <= jvals[i + 1] for i in range(4)):
+            resultat['etat'] = 'proposition_a_valider'
+            resultat['raison'] = 'Extraction structurée non certifiée ; contrôler la source et l’opposabilité.'
+        else:
+            resultat['raison'] = 'Progression des montants incohérente'
     return resultat
 
 
-def corps_ticket(candidat: dict) -> str:
-    indices = candidat['indices']
-    morceaux = [
-        '## Publication officielle détectée — contrôle juridique requis',
-        '',
-        '**Aucune mise à jour du barème public n’a été effectuée.**',
-        '',
-        f"- Titre extrait : {candidat['titre']}",
-        f"- Archive DILA : {candidat['archive_officielle']}",
-        f"- Fichier dans l’archive : `{candidat['chemin_dans_archive']}`",
-        f"- Légifrance (si identifiable) : {candidat['texte_legifrance'] or 'Identifiant non extrait'}",
-        f"- Dates repérées : {', '.join(indices['dates_reperees']) or 'Aucune'}",
-        f"- Montants repérés (non attribués) : {', '.join(indices['montants_reperes']) or 'Aucun'}",
-        '', '### Repérage brut par zone (ordre et nature des montants à vérifier)',
-        '',
-        '| Zone | Montants présents à proximité (non attribués) |',
-        '|---|---|',
-        *[f"| {z['zone']} | {', '.join(z['montants_non_attribues']) or 'Non extrait'} |" for z in indices['zones']],
-        '', '### Extrait automatiquement préparé (non certifié)',
-        '', '> ' + candidat['extrait'].replace('\n', ' ').replace('>', '›'),
-        '', '### Contrôles obligatoires avant publication',
-        '- [ ] Texte effectivement relatif aux ouvriers du bâtiment (IDCC 1596 et/ou 1597) en Hauts-de-France.',
-        '- [ ] Accord nouveau ou rectificatif, et articulation avec les accords précédents.',
-        '- [ ] Organisation(s) patronale(s) signataire(s) et date d’effet.',
-        '- [ ] Arrêté d’extension, publication au Journal officiel et date d’opposabilité.',
-        '- [ ] Montants repas, transport et trajet des cinq zones, dans le bon ordre.',
-        '- [ ] Validation par un professionnel avant ajout manuel à `baremes.json`.',
-        '', 'Ce ticket est un **signal de veille**, non un accord validé ni un droit individuel à indemnisation.',
-    ]
-    return '\n'.join(morceaux)[:60000]
+def cle_accord(titre: str, texte: str) -> tuple[str, str | None]:
+    date = date_accord(titre) or date_accord(texte[:900])
+    # Un même accord IDCC 1596 et IDCC 1597 est regroupé par date de signature.
+    # Si date absente, regrouper par titre normalisé, sans y associer un barème automatiquement.
+    if date:
+        return 'accord-' + date, date
+    propre = normaliser(titre)[:130] if titre else normaliser(texte[:150])
+    return 'titre-' + hashlib.sha256(propre.encode('utf-8')).hexdigest()[:16], None
 
 
-def publier_tickets(candidats: list[dict], depot: str, jeton: str) -> tuple[int, int]:
-    existants = tickets_existants(depot, jeton)
-    nouveaux = 0
-    ignores = 0
-    for candidat in candidats:
-        cle = candidat['cle']
-        if cle in existants:
-            ignores += 1
-            continue
-        if nouveaux >= LIMITE_TICKETS:
-            print(f'Attention : limite de {LIMITE_TICKETS} tickets atteinte, consulter le rapport intégral.')
+def reference(texte: str, chemin: str, famille: str) -> str | None:
+    motif = r'KALI(?:TEXT|ARTI)\d{10,}' if famille == 'KALI' else r'JORFTEXT\d{10,}'
+    ident = re.search(motif, texte + ' ' + chemin, re.I)
+    if not ident:
+        return None
+    numero = ident.group().upper()
+    if famille == 'JORF':
+        return f'https://www.legifrance.gouv.fr/jorf/id/{numero}'
+    nature = 'id' if numero.startswith('KALITEXT') else 'article'
+    return f'https://www.legifrance.gouv.fr/conv_coll/{nature}/{numero}'
+
+
+def analyser_archive(chemin: str, famille: str, url_archive: str) -> dict:
+    """Flux borné : n'ouvre jamais un chemin extrait du tar sur le disque."""
+    groupes = {}
+    total = 0
+    with tarfile.open(chemin, 'r:gz') as archive:
+        for membre in archive:
+            if not membre.isfile() or not membre.name.lower().endswith('.xml'):
+                continue
+            total += 1
+            if not 0 < membre.size <= LIMITE_XML:
+                continue
+            flux = archive.extractfile(membre)
+            if flux is None:
+                continue
+            texte, titre = donnees_xml(flux.read(LIMITE_XML + 1))
+            pertinent = est_accord_cible(texte, titre) if famille == 'KALI' else est_extension_cible(texte, titre)
+            if not pertinent:
+                continue
+            if famille == 'KALI':
+                ident, date = cle_accord(titre, texte)
+            else:
+                identifiant = re.search(r'JORFTEXT\d{10,}', membre.name + ' ' + texte, re.I)
+                nor = re.search(r'\b[A-Z]{4}\d{7}[A-Z]\b', texte)
+                ident = 'extension-' + (identifiant.group().upper() if identifiant else (nor.group() if nor else hashlib.sha256((titre + texte[:150]).encode()).hexdigest()[:18]))
+                date = None
+            if ident not in groupes:
+                groupes[ident] = {'cle': ident, 'famille': famille, 'date_signature': date,
+                    'titre': titre or 'Texte officiel à contrôler', 'source_archive': url_archive,
+                    'textes_legifrance': [], 'fichiers_sources': [], 'extraction': None, 'extrait': ''}
+            g = groupes[ident]
+            lien = reference(texte, membre.name, famille)
+            if lien and lien not in g['textes_legifrance']:
+                g['textes_legifrance'].append(lien)
+            if len(g['fichiers_sources']) < 12:
+                g['fichiers_sources'].append(membre.name)
+            if len(g['extrait']) < 650 and len(texte) > len(g['extrait']):
+                g['extrait'] = texte[:1400]
+            if famille == 'KALI':
+                ext = extraire_grille(texte)
+                if ext['etat'] == 'proposition_a_valider':
+                    # En cas de grilles distinctes au sein d'un accord, bloquer l'affectation.
+                    if g['extraction'] and any(g['extraction'].get(p) != ext.get(p) for p in ('repas','transport','trajet')):
+                        g['extraction'] = {'etat': 'non_reconstitue', 'raison': 'Plusieurs grilles différentes dans cet accord',
+                                           'repas': None, 'transport': None, 'trajet': None, 'date_effet_proposee': None}
+                    elif not g['extraction']:
+                        g['extraction'] = ext
+            else:
+                if not g.get('date_publication_proposee'):
+                    m = re.search(r'(?:JORF|publication)\s+(?:du\s+)?(\d{1,2}\s+\w+\s+20\d{2})', normaliser(texte))
+                    if m:
+                        g['date_publication_proposee'] = m.group(1)
+                g['objet_extension_a_verifier'] = True
+    resultat = list(groupes.values())
+    for g in resultat:
+        g['textes_legifrance'] = g['textes_legifrance'][:8]
+        if famille == 'KALI' and not g['extraction']:
+            g['extraction'] = {'etat': 'non_reconstitue', 'raison': 'Aucun tableau complet et non ambigu repéré',
+                               'repas': None, 'transport': None, 'trajet': None, 'date_effet_proposee': None}
+    return {'archive': url_archive, 'fichiers_xml_examines': total, 'groupes': resultat}
+
+
+def bilan_temoins(groupes: list[dict]) -> dict:
+    """Contrôle rétrospectif : 2024/2025/2026, sans aucun changement du référentiel."""
+    bilan = {}
+    for date, attendu in TEMOINS.items():
+        correspondants = [g for g in groupes if g.get('date_signature') == date and g['famille'] == 'KALI']
+        grilles = [g['extraction'] for g in correspondants if g['extraction']['etat'] == 'proposition_a_valider']
+        status = 'introuvable'
+        if correspondants:
+            status = 'texte_retrouve_grille_non_reconstituee'
+        if grilles:
+            status = 'conforme' if any(all(gr.get(k) == attendu.get(k) for k in ('repas', 'transport', 'trajet')) for gr in grilles) else 'ecart_a_verifier'
+        bilan[date] = {'etat': status, 'nombre_textes_regroupes': len(correspondants),
+                       'textes_legifrance': [l for g in correspondants for l in g['textes_legifrance']][:6]}
+    return bilan
+
+
+def candidats_nouveaux(groupes: list[dict], mode: str) -> list[dict]:
+    """Historique connu visible au rapport, mais jamais signalé en tickets."""
+    liste = []
+    for g in groupes:
+        if g['famille'] == 'JORF':
+            liste.append(g)
+        elif mode == 'quotidien':
+            # Un complément daté représente une publication ou correction récente,
+            # même si le texte d'accord lui-même est ancien.
+            liste.append(g)
+        elif g.get('date_signature') and g['date_signature'] > DERNIER_ACCORD_CONNU:
+            liste.append(g)
+        # En archive globale, ne pas signaler les anciens articles sans date :
+        # ils causeraient des alertes historiques sans intérêt.
+    return liste
+
+
+def appel_github(adresse: str, jeton: str, methode='GET', donnees=None):
+    charge = json.dumps(donnees, ensure_ascii=False).encode('utf-8') if donnees is not None else None
+    demande = Request(adresse, data=charge, method=methode, headers={
+        'Authorization': 'Bearer ' + jeton, 'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28', 'Content-Type': 'application/json',
+        'User-Agent': AGENT})
+    with urlopen(demande, timeout=75) as reponse:
+        return json.load(reponse)
+
+
+def tickets_deja_signales(depot: str, jeton: str) -> set[str]:
+    existants = set()
+    for page in range(1, 12):
+        adresse = f'https://api.github.com/repos/{depot}/issues?state=all&per_page=100&page={page}'
+        liste = appel_github(adresse, jeton)
+        if not isinstance(liste, list):
+            raise ValueError('Liste des tickets GitHub incorrecte.')
+        for ticket in liste:
+            m = re.search(r'\[A3C:(accord-\d{4}-\d{2}-\d{2}|extension-[\w-]+|titre-[0-9a-f]+)\]', ticket.get('title', ''))
+            if m:
+                existants.add(m.group(1))
+        if len(liste) < 100:
             break
-        titre = f"[KALI:{cle}] À vérifier — {candidat['titre'][:110]}"
-        requete_github(f'https://api.github.com/repos/{depot}/issues',jeton,'POST',
-                       {'title': titre, 'body': corps_ticket(candidat)})
-        print('Ticket créé :', titre)
+    return existants
+
+
+def description_ticket(g: dict) -> str:
+    x = g.get('extraction') or {}
+    parties = ['### Signal officiel détecté — contrôle juridique obligatoire',
+       '**Le fichier `baremes.json` n’est jamais modifié par cette automatisation.**',
+       f"- Famille : {g['famille']}", f"- Texte : {g['titre']}",
+       f"- Date de signature repérée : {g.get('date_signature') or 'Non identifiée'}",
+       f"- Archive officielle : {g['source_archive']}",
+       '- Sources Légifrance : ' + ', '.join(g.get('textes_legifrance') or ['Non identifiées']),
+       '- État de l’extraction : ' + x.get('etat', 'Extension à vérifier'),
+       '- Date d’effet proposée : ' + str(x.get('date_effet_proposee') or 'Non établie'),
+       '', '| Zone | Repas | Transport | Trajet |', '|---|---:|---:|---:|']
+    for i in range(5):
+        parties.append(f"| {i+1} | {x.get('repas') or 'À établir'} | "
+                       f"{(x.get('transport') or ['—']*5)[i]} | {(x.get('trajet') or ['—']*5)[i]} |")
+    parties += ['', '### Contrôles nécessaires',
+       '- [ ] Vérifier les IDCC 1596 et/ou 1597 et le territoire Hauts-de-France.',
+       '- [ ] Vérifier la nature de l’accord et les organisations signataires.',
+       '- [ ] Vérifier les trois indemnités et les cinq zones dans le texte officiel.',
+       '- [ ] Vérifier la date de prise d’effet et l’arrêté d’extension au JORF.',
+       '- [ ] Vérifier les éventuelles exclusions, réserves ou modifications.',
+       '- [ ] Valider juridiquement avant tout ajout manuel au référentiel.',
+       '', 'Extrait documentaire (non certifié) :', '> ' + g.get('extrait', '').replace('>', '›')]
+    return '\n'.join(parties)[:60000]
+
+
+def creer_tickets(groupes: list[dict], depot: str, jeton: str) -> tuple[int, int]:
+    existants = tickets_deja_signales(depot, jeton)
+    nouveaux = doubles = 0
+    for g in groupes:
+        if g['cle'] in existants:
+            doubles += 1
+            continue
+        if nouveaux >= LIMITE_ALERTES:
+            break
+        titre = f"[A3C:{g['cle']}] Veille — {g['titre'][:95]}"
+        appel_github(f'https://api.github.com/repos/{depot}/issues', jeton, 'POST',
+                     {'title': titre, 'body': description_ticket(g)})
         nouveaux += 1
-    return nouveaux, ignores
+    return nouveaux, doubles
 
 
 def execution(argv=None) -> int:
-    parseur = argparse.ArgumentParser(description='Veille DILA/KALI du bâtiment HDF, sans modification des barèmes publiés.')
-    parseur.add_argument('--mode', choices=['quotidien', 'complet'], default='quotidien')
-    parseur.add_argument('--archive-locale', help='Archive tar.gz de test : évite tout téléchargement')
-    parseur.add_argument('--rapport', default='rapport_veille.json')
-    parseur.add_argument('--creer-tickets', action='store_true')
-    arguments = parseur.parse_args(argv)
+    p = argparse.ArgumentParser(description='Veille officielle A3C V17 : KALI + JORF, sans mise à jour automatique des barèmes.')
+    p.add_argument('--mode', choices=['quotidien','complet','retroactif'], default='quotidien')
+    p.add_argument('--rapport', default='rapport_veille.json')
+    p.add_argument('--creer-tickets', action='store_true')
+    p.add_argument('--archive-kali-locale', help='Test hors ligne : archive KALI')
+    p.add_argument('--archive-jorf-locale', help='Test hors ligne : archive JORF')
+    args = p.parse_args(argv)
+    erreurs = []
+    analyses = []
     try:
-        if arguments.archive_locale:
-            adresse = 'fichier local de test'
-            chemin = arguments.archive_locale
+        kali = archives_disponibles(lire_index(SOURCE_KALI), 'KALI') if not args.archive_kali_locale else None
+        jorf = (archives_disponibles(lire_index(SOURCE_JORF), 'JORF')
+                if not args.archive_jorf_locale and args.mode != 'retroactif' else None)
+        if args.archive_kali_locale:
+            sources_kali = [(args.archive_kali_locale, True)]
+        elif args.mode in ('complet', 'retroactif'):
+            sources_kali = [(kali['global'], False)] if kali['global'] else []
         else:
-            liens = repertoire_officiel(lire_index())
-            if arguments.mode not in liens:
-                raise ValueError(f"Archive « {arguments.mode} » absente du répertoire DILA.")
-            adresse = liens[arguments.mode]
-            chemin = telecharger_archive(adresse)
-        try:
-            candidats, compte = analyser_archive(chemin, adresse)
-        finally:
-            if not arguments.archive_locale:
-                Path(chemin).unlink(missing_ok=True)
+            sources_kali = [(url, False) for url in kali['quotidiens'][-1:]]
+        if args.archive_jorf_locale:
+            sources_jorf = [(args.archive_jorf_locale, True)]
+        elif args.mode == 'retroactif':
+            sources_jorf = []  # 1,6 Go : historique JORF non téléchargé.
+        else:
+            sources_jorf = [(url, False) for url in (jorf or {}).get('quotidiens', [])]
+        if not sources_kali:
+            raise ValueError('Aucune archive KALI disponible.')
+        for famille, sources in [('KALI',sources_kali), ('JORF',sources_jorf)]:
+            for url, local in sources:
+                fichier = url if local else None
+                try:
+                    if not local:
+                        fichier = telecharger(url, LIMITE_KALI if famille == 'KALI' else LIMITE_JORF)
+                    analyses.append(analyser_archive(fichier, famille, url if not local else 'Archive locale de test'))
+                except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as ex:
+                    erreurs.append(f'{famille} — {url} : {str(ex)[:230]}')
+                finally:
+                    if not local and fichier:
+                        Path(fichier).unlink(missing_ok=True)
+        groupes = {}
+        for analyse in analyses:
+            for groupe in analyse['groupes']:
+                if groupe['cle'] not in groupes:
+                    groupes[groupe['cle']] = groupe
+                else:
+                    ancien = groupes[groupe['cle']]
+                    ancien['textes_legifrance'] = list(dict.fromkeys(ancien['textes_legifrance'] + groupe['textes_legifrance']))[:8]
+                    if ancien['famille'] == 'KALI' and ancien['extraction']['etat'] != 'proposition_a_valider' and groupe['extraction']['etat'] == 'proposition_a_valider':
+                        ancien['extraction'] = groupe['extraction']
+        ordonnes = list(groupes.values())
+        alertes = candidats_nouveaux(ordonnes, args.mode)
+        bilan = bilan_temoins(ordonnes) if args.mode != 'quotidien' else {}
         rapport = {
-            'source': ADRESSE_SOURCE,
-            'archive_controlee': adresse,
-            'mode': arguments.mode,
-            'controle_utc': dt.datetime.now(dt.timezone.utc).isoformat(),
-            'fichiers_xml_examines': compte,
-            'nombre_documents_a_verifier': len(candidats),
-            'documents': candidats,
-            'avertissement': 'Détection documentaire partielle : absence de résultat ≠ absence de nouvel accord ou arrêté d’extension.',
+            'version': '17.0', 'horodatage_utc': datetime.now(timezone.utc).isoformat(),
+            'mode': args.mode, 'sources': [SOURCE_KALI, SOURCE_JORF],
+            'archives': [{'adresse': a['archive'], 'fichiers_xml_examines': a['fichiers_xml_examines'],
+                          'documents_regroupes': len(a['groupes'])} for a in analyses],
+            'nombre_documents_regroupes': len(ordonnes),
+            'nombre_alertes_potentielles': len(alertes),
+            'controle_retrospectif': bilan,
+            'documents': ordonnes if args.mode != 'quotidien' else alertes,
+            'erreurs': erreurs,
+            'limites': [
+                'Détection non exhaustive, y compris en cas d’absence de résultat.',
+                'JORF : contrôle des dernières archives quotidiennes, pas du stock historique de 1,6 Go.',
+                'Dates d’effet et d’extension à valider séparément ; extraction des grilles jamais opposable automatiquement.',
+                'Aucun accord ni montant n’est ajouté à baremes.json par ce programme.',
+            ],
             'baremes_modifies': False,
         }
-        Path(arguments.rapport).write_text(json.dumps(rapport, ensure_ascii=False, indent=2), encoding='utf-8')
-        print(f"Archive contrôlée : {adresse}")
-        print(f"XML examinés : {compte}. Publications à examiner : {len(candidats)}.")
-        if arguments.creer_tickets:
-            depot = os.getenv('GITHUB_REPOSITORY', '')
-            jeton = os.getenv('GITHUB_TOKEN', '')
+        Path(args.rapport).write_text(json.dumps(rapport, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        print('V17 :', len(analyses), 'archives analysées ;', len(ordonnes), 'groupes de textes ;', len(alertes), 'alertes potentielles.')
+        for cle, info in bilan.items():
+            print('Témoin', cle, ':', info['etat'])
+        if args.creer_tickets and args.mode != 'retroactif' and alertes:
+            depot, jeton = os.getenv('GITHUB_REPOSITORY',''), os.getenv('GITHUB_TOKEN','')
             if not depot or not jeton:
-                raise ValueError('Jeton GitHub ou nom de dépôt manquant : aucun ticket créé.')
-            nouveaux, ignores = publier_tickets(candidats, depot, jeton)
-            print(f'Tickets créés : {nouveaux}. Déjà signalés : {ignores}.')
-        print('Le fichier baremes.json reste inchangé.')
+                erreurs.append('Création des tickets impossible : dépôt ou jeton GitHub absent.')
+            else:
+                try:
+                    nouveaux, doubles = creer_tickets(alertes, depot, jeton)
+                    print('Tickets créés :', nouveaux, 'déjà présents :', doubles)
+                except (OSError, ValueError, HTTPError, URLError) as ex:
+                    erreurs.append('Tickets GitHub : ' + str(ex))
+        # Réécriture du rapport si erreur survenue pendant la notification.
+        if erreurs:
+            rapport['erreurs'] = erreurs
+            Path(args.rapport).write_text(json.dumps(rapport, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+            for erreur in erreurs:
+                print('ATTENTION :', erreur, file=sys.stderr)
+            return 1  # Ne pas afficher de coche verte lors d'un contrôle incomplet.
         return 0
-    except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as erreur:
-        print('ÉCHEC DE LA VEILLE :', erreur, file=sys.stderr)
+    except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as ex:
+        print('ÉCHEC DU PROGRAMME :', ex, file=sys.stderr)
         return 1
 
 
