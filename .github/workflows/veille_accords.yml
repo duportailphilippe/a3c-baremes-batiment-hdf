@@ -1,0 +1,64 @@
+name: Veille officielle des accords Bâtiment Hauts-de-France
+
+on:
+  schedule:
+    # En UTC : recherche quotidienne des publications KALI les plus récentes.
+    - cron: '23 7 * * *'
+    # Le dimanche : réexamen de l'archive KALI globale, si disponible.
+    - cron: '43 6 * * 0'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Type de contrôle à lancer'
+        required: true
+        type: choice
+        default: quotidien
+        options:
+          - quotidien
+          - complet
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: veille-a3c-kali
+  cancel-in-progress: false
+
+jobs:
+  surveillance:
+    name: Vérification des publications DILA / KALI
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Récupérer le programme de veille
+        uses: actions/checkout@v4
+      - name: Préparer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Effectuer les tests de contrôle
+        run: python -m unittest discover -s outils -p 'test_veille_accords.py' -v
+      - name: Contrôler les textes officiels et ouvrir les alertes utiles
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EVENEMENT: ${{ github.event_name }}
+          PLANIFICATION: ${{ github.event.schedule }}
+          CHOIX_MANUEL: ${{ inputs.mode }}
+        shell: bash
+        run: |
+          MODE='quotidien'
+          if [[ "$PLANIFICATION" == '43 6 * * 0' || "$CHOIX_MANUEL" == 'complet' ]]; then
+            MODE='complet'
+          fi
+          echo "Contrôle DILA/KALI : $MODE"
+          python outils/veille_accords.py --mode "$MODE" --rapport rapport_veille.json --creer-tickets
+      - name: Conserver le rapport de veille pour audit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rapport-a3c-kali-${{ github.run_id }}
+          path: rapport_veille.json
+          if-no-files-found: ignore
+          retention-days: 30
