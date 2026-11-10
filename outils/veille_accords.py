@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Veille A3C V19 — surveillance KALI, BOCC et XML JORF/ JORFSIMPLE de la DILA.
+"""Veille A3C V20 — surveillance KALI, BOCC et XML JORF/ JORFSIMPLE de la DILA.
 
 La detection des extensions ne depend pas d'une page HTML Legifrance ni d'un identifiant
 JORF preinscrit. Le rapport distingue preuve officielle lue et temoins non evaluables.
@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
 from html import unescape
@@ -36,7 +36,7 @@ SOURCE_JORF = 'https://echanges.dila.gouv.fr/OPENDATA/JORF/'
 SOURCE_JORFSIMPLE = 'https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/'
 SOURCE_BOCC = 'https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/'
 BOCC_TEMOIN_2026 = 'CCO20260038.complet.taz'
-AGENT = 'A3C-Veille-Accords/19 (veille documentaire DILA; depot GitHub a3c-baremes-batiment-hdf)'
+AGENT = 'A3C-Veille-Accords/20 (veille documentaire DILA; depot GitHub a3c-baremes-batiment-hdf)'
 LIMITE_KALI = 340_000_000
 LIMITE_JORF = 125_000_000  # Les stocks JORF/JORFSIMPLE > 1 Go sont exclus
 LIMITE_XML = 6_000_000
@@ -714,7 +714,7 @@ def fusionner_groupes(analyses: list[dict]) -> list[dict]:
 
 
 def charger_etat(chemin: str | None) -> dict:
-    etat = {'version': '19.0', 'archives_traitees': {}, 'derniere_date_jorf': None}
+    etat = {'version': '20.0', 'archives_traitees': {}, 'derniere_date_jorf': None}
     if not chemin or not Path(chemin).is_file():
         return etat
     lu = json.loads(Path(chemin).read_text(encoding='utf-8'))
@@ -763,9 +763,265 @@ def ecarts_de_couverture(etat: dict, adresses: list[str]) -> list[str]:
     return []
 
 
+# === V20 : contrôle historique officiel, sans téléchargement d'un stock JORF sur le disque ===
+# IMPORTANT : uniquement le mode manuel « temoin » utilise l'archive massive.
+# La recherche parcourt librement les XML à partir de leur date de publication :
+# aucun identifiant JORFTEXT n'est utilisé pour les sélectionner.
+
+MAX_ARCHIVE_HISTORIQUE_COMPRIMEE = 2_000_000_000
+MAX_XML_HISTORIQUES = 8_000_000
+DATE_ACCORD_TEMOIN = '2026-07-10'
+DATE_PUBLICATION_TEMOIN = '2026-10-31'
+ID_JORF_ATTENDU_POUR_CONTROLE = 'JORFTEXT000055037883'  # contrôle A POSTERIORI exclusivement
+
+
+class FluxBorne:
+    """Limite les octets COMPRIMÉS lus ; ne met pas 1,1 Go en mémoire ou disque."""
+    def __init__(self, source, maximum=None):
+        self.source = source
+        self.maximum = MAX_ARCHIVE_HISTORIQUE_COMPRIMEE if maximum is None else maximum
+        self.volume = 0
+
+    def read(self, n=-1):
+        bloc = self.source.read(n)
+        self.volume += len(bloc)
+        if self.volume > self.maximum:
+            raise ValueError('Stock JORF trop volumineux pour ce contrôle borné.')
+        return bloc
+
+
+def archive_globale_jorf_simple(index: str) -> str | None:
+    """Sélection depuis l'index HTTPS officiel, sans URL horodatée imaginée."""
+    lecteur = Liens()
+    lecteur.feed(index)
+    noms = [x.rsplit('/', 1)[-1] for x in lecteur.liens]
+    correspondants = sorted(n for n in noms
+                           if re.fullmatch(r'Freemium_jorf_simple_20\d{6}-\d{6}\.tar\.gz', n, re.I))
+    return urljoin(SOURCE_JORFSIMPLE, correspondants[-1]) if correspondants else None
+
+
+def dates_xml_metadata(brut: bytes) -> str | None:
+    """Utilise DATE_PUBLI de l'XML, sans déduire la date de l'archive."""
+    return date_publication_xml(brut)
+
+
+def confirmation_extension_obligatoire(texte: str, date_accord_cible: str) -> bool:
+    """Vérifie qu'un article rend obligatoire l'accord visé : pas seulement un visa « Vu »."""
+    t = normaliser(texte)
+    for mention in re.finditer(r'\bsont rendues obligatoires\b', t):
+        bloc = t[mention.end():mention.end()+1600]
+        # La mention d'un AUTRE article ne peut pas servir de preuve.
+        limite = re.search(r'\barticle\s+[1-9][0-9]?\b|\bsont rendues obligatoires\b', bloc)
+        if limite:
+            bloc = bloc[:limite.start()]
+        if any(a.get('date_signature') == date_accord_cible
+               for a in accords_etendus_dans_texte(bloc)):
+            return True
+    return False
+
+
+def qualification_temoin_document(brut: bytes, nom: str, date_cible: str) -> dict | None:
+    """Qualifie UNE pièce XML selon les dates et les mentions réellement présentes.
+
+    L'identifiant attendu de 2026 n'entre pas dans la recherche : la validation
+    rétrospective le compare à ce qui a été lu (après recherche).
+    """
+    date_xml = dates_xml_metadata(brut)
+    if date_xml != date_cible:
+        return None
+    texte, titre = donnees_xml(brut)
+    if not est_extension_cible(texte, titre):
+        return None
+    accords = accords_etendus_dans_texte(texte)
+    lien = reference(texte, nom, 'JORFSIMPLE')
+    ident = re.search(r'JORFTEXT\d{10,}', (lien or '') + ' ' + nom)
+    nor = re.search(r'\b[A-Z]{4}\d{7}[A-Z]\b', texte)
+    return {
+        'titre': titre, 'date_publication_xml': date_xml,
+        'qualification': qualification_texte_jorf(texte, titre),
+        'accords_vises': accords,
+        'accord_temoignage_rendu_obligatoire_dans_article': confirmation_extension_obligatoire(texte, DATE_ACCORD_TEMOIN),
+        'lien_legifrance': lien,
+        'identifiant_jorf_detecte': ident.group().upper() if ident else None,
+        'nor_detecte': nor.group() if nor else None,
+        'fichier_archive': nom,
+        'empreinte_sha256_xml': hashlib.sha256(brut).hexdigest(),
+        'extrait': texte[:1600],
+    }
+
+
+def scanner_stock_jorf_vers_temoins(flux_binaire, date_cible: str, chemin_archive: str,
+                                    dossier_preuves: str | None = None,
+                                    arret_apres_temoignage: bool = True,
+                                    authentifie_dila: bool = False) -> dict:
+    """Lit une archive TAR.GZ en flux ; arrêt après preuve de l'accord du 10/07/2026.
+
+    Si le flux est incomplet et qu'aucune preuve n'a été trouvée, la vérification
+    échoue explicitement ; aucune absence de publication n'en est déduite.
+    """
+    date.fromisoformat(date_cible)  # validation de l'entrée
+    bornage = FluxBorne(flux_binaire)
+    resultat = {'archive_officielle': chemin_archive,
+                'acces_dila_direct': bool(authentifie_dila),
+                'date_publication_recherchee': date_cible,
+                'date_signature_recherchee': DATE_ACCORD_TEMOIN,
+                'fichiers_xml_parcourus': 0,
+                'fichiers_du_jour_examines': 0,
+                'documents_candidates_extension': [],
+                'octets_comprimes_lus': 0,
+                'archive_parcourue_en_entier': False,
+                'arret_apres_preuve': False,
+                'preuve_officielle_retrouvee': False,
+                'identifiant_controle_a_posteriori': ID_JORF_ATTENDU_POUR_CONTROLE,
+                'concordance_identifiant_attendu': None,
+                'erreur': None}
+    trouve = False
+    try:
+        with tarfile.open(fileobj=bornage, mode='r|gz', bufsize=256 * 1024) as archive:
+            for membre in archive:
+                if not membre.isfile() or not membre.name.lower().endswith('.xml'):
+                    continue
+                resultat['fichiers_xml_parcourus'] += 1
+                if resultat['fichiers_xml_parcourus'] > MAX_XML_HISTORIQUES:
+                    raise ValueError('Limite du nombre de XML du stock atteinte.')
+                if not 0 < membre.size <= LIMITE_XML:
+                    continue
+                flux = archive.extractfile(membre)
+                if flux is None:
+                    continue
+                brut = flux.read(LIMITE_XML + 1)
+                # Préfiltrage par date, jamais par identifiant officiel du témoin.
+                iso = date_cible.encode('ascii')
+                compact = date_cible.replace('-', '').encode('ascii')
+                if iso not in brut and compact not in brut:
+                    continue
+                date_xml = dates_xml_metadata(brut)
+                if date_xml != date_cible:
+                    continue
+                resultat['fichiers_du_jour_examines'] += 1
+                qualif = qualification_temoin_document(brut, membre.name, date_cible)
+                if qualif is None:
+                    continue
+                qualif['preuve_dila'] = bool(authentifie_dila)
+                resultat['documents_candidates_extension'].append(qualif)
+                correspond = any(a.get('date_signature') == DATE_ACCORD_TEMOIN
+                                 for a in qualif['accords_vises'])
+                # Une référence JORFTEXT issue de la pièce est requise pour la preuve témoin.
+                if (correspond and qualif['identifiant_jorf_detecte']
+                        and qualif['accord_temoignage_rendu_obligatoire_dans_article']):
+                    trouve = True
+                    resultat['concordance_identifiant_attendu'] = (
+                        qualif['identifiant_jorf_detecte'] == ID_JORF_ATTENDU_POUR_CONTROLE)
+                    if dossier_preuves:
+                        racine = Path(dossier_preuves)
+                        racine.mkdir(parents=True, exist_ok=True)
+                        fichier = racine / ('temoin_jorf_' + date_cible + '.xml')
+                        fichier.write_bytes(brut)
+                        qualif['piece_xml_conservee'] = str(fichier)
+                    if arret_apres_temoignage:
+                        resultat['arret_apres_preuve'] = True
+                        break
+            else:
+                resultat['archive_parcourue_en_entier'] = True
+    except (OSError, EOFError, tarfile.TarError, ValueError) as erreur:
+        resultat['erreur'] = type(erreur).__name__ + ' : ' + str(erreur)[:200]
+    resultat['octets_comprimes_lus'] = bornage.volume
+    resultat['preuve_officielle_retrouvee'] = bool(trouve and authentifie_dila and not resultat['erreur'])
+    return resultat
+
+
+def verdict_temoin_v20(analyse: dict) -> tuple[str, list[str]]:
+    """Statut strict : un simple XML de test ne vaut pas preuve DILA."""
+    anomalies = []
+    if analyse['erreur']:
+        anomalies.append('Lecture interrompue : ' + analyse['erreur'])
+        return 'controle_incomplet', anomalies
+    if analyse['preuve_officielle_retrouvee']:
+        if not analyse.get('concordance_identifiant_attendu'):
+            anomalies.append('L’identifiant détecté ne correspond pas à la référence témoin attendue.')
+            return 'discordance_a_verifier', anomalies
+        return 'preuve_officielle_dila_retrouvee', anomalies
+    if analyse.get('concordance_identifiant_attendu') is not None:
+        return 'test_local_non_authentifie', ['Archive locale : origine officielle non prouvée.']
+    if analyse['archive_parcourue_en_entier']:
+        anomalies.append('Le témoin n’a pas été retrouvé dans ce stock ; vérifier le format et le périmètre de la source.')
+        return 'temoin_non_retrouve', anomalies
+    anomalies.append('Parcours incomplet de l’archive ; aucune conclusion sur l’absence du témoin.')
+    return 'controle_incomplet', anomalies
+
+
+def execution_temoin_v20(args) -> int:
+    """Exécution manuelle intensive : ne modifie ni état de suivi ni tickets ni barèmes."""
+    horodatage = datetime.now(timezone.utc).isoformat()
+    url = None
+    try:
+        cible = date.fromisoformat(args.date_temoin).isoformat()
+    except ValueError:
+        cible = args.date_temoin
+        erreur_date = 'Date témoin invalide (format attendu AAAA-MM-JJ).'
+    else:
+        erreur_date = None
+    local = args.archive_jorfsimple_locale or args.archive_jorf_locale
+    erreur_index = None
+    if not local and not erreur_date:
+        try:
+            url = archive_globale_jorf_simple(lire_index(SOURCE_JORFSIMPLE))
+            if not url:
+                raise ValueError('Aucune archive globale JORFSIMPLE dans l’index officiel.')
+            date_stock = re.search(r'(20\d{6})-\d{6}\.tar\.gz$', url)
+            if date_stock and datetime.strptime(date_stock.group(1), '%Y%m%d').date() < date.fromisoformat(cible):
+                raise ValueError('Le stock officiel est antérieur à la date du témoin recherché.')
+        except (OSError, ValueError) as erreur:
+            erreur_index = str(erreur)
+    source = ('Archive XML locale fournie pour test' if local else url)
+    analyse = None
+    if not erreur_date and not erreur_index:
+        try:
+            contexte = open(local, 'rb') if local else ouvrir(url)
+            with contexte as flux:
+                analyse = scanner_stock_jorf_vers_temoins(
+                    flux, cible, source, dossier_preuves=args.dossier_preuves,
+                    authentifie_dila=bool(not local and url and url.startswith(SOURCE_JORFSIMPLE)))
+        except (OSError, TimeoutError, ValueError) as erreur:
+            erreur_index = str(erreur)
+    if analyse is None:
+        analyse = {'erreur': erreur_date or erreur_index, 'archive_officielle': source,
+                   'preuve_officielle_retrouvee': False, 'archive_parcourue_en_entier': False,
+                   'documents_candidates_extension': [], 'fichiers_xml_parcourus': 0,
+                   'fichiers_du_jour_examines': 0, 'octets_comprimes_lus': 0,
+                   'concordance_identifiant_attendu': None}
+    etat, alertes = verdict_temoin_v20(analyse)
+    resultat = {
+        'version': '20.0', 'mode': 'temoin', 'horodatage_utc': horodatage,
+        'etat_controle': etat,
+        'date_publication_attendue': cible,
+        'date_signature_attendue': DATE_ACCORD_TEMOIN,
+        'temoin_jorf': analyse,
+        'alertes_controle': alertes,
+        'erreurs': [analyse['erreur']] if analyse.get('erreur') else [],
+        'baremes_modifies': False,
+        'etat_de_veille_modifie': False,
+        'mise_en_application': 'Aucune conclusion d’opposabilité sans contrôle juridique de l’arrêté et de l’accord.',
+        'limites': [
+            'La preuve repose sur un XML effectivement lu dans un flux HTTPS DILA ; aucun certificat ou signature XML indépendante n’est disponible ici.',
+            'Le contrôle peut arrêter le parcours après la preuve ; il ne certifie pas l’intégralité du stock.',
+            'La référence JORFTEXT attendue est vérifiée après la détection, jamais utilisée pour sélectionner les XML.',
+            'Aucune modification du fichier baremes.json ou du fichier suivi/etat_veille.json.',
+        ],
+    }
+    destination = Path(args.rapport)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(resultat, indent=2, ensure_ascii=False) + '\n', encoding='utf-8')
+    print(f'V20 témoin historique : {etat} ; {analyse["fichiers_xml_parcourus"]} XML parcourus ; '
+          f'{len(analyse["documents_candidates_extension"])} candidats.')
+    for x in alertes:
+        print('ATTENTION :', x, file=sys.stderr)
+    return 0 if etat == 'preuve_officielle_dila_retrouvee' else 2 if etat == 'test_local_non_authentifie' else 1
+
+
 def execution(argv=None) -> int:
-    p = argparse.ArgumentParser(description='Veille A3C V19 : archives XML DILA, sans accès automatisé aux pages HTML Légifrance.')
-    p.add_argument('--mode', choices=['quotidien', 'complet', 'retroactif'], default='quotidien')
+    p = argparse.ArgumentParser(description='Veille A3C V20 : archives XML DILA, sans accès automatisé aux pages HTML Légifrance.')
+    p.add_argument('--mode', choices=['quotidien', 'complet', 'retroactif', 'temoin'], default='quotidien')
     p.add_argument('--rapport', default='rapport_veille.json')
     p.add_argument('--etat', help='Fichier de suivi persistant des archives, optionnel en test local')
     p.add_argument('--creer-tickets', action='store_true')
@@ -773,15 +1029,20 @@ def execution(argv=None) -> int:
     p.add_argument('--archive-jorf-locale')
     p.add_argument('--archive-jorfsimple-locale')
     p.add_argument('--archive-bocc-locale')
+    p.add_argument('--date-temoin', default='2026-10-31', help='Date JORF témoin (AAAA-MM-JJ) ; mode temoin uniquement')
+    p.add_argument('--dossier-preuves', default='preuves_veille', help='Pièces XML de contrôle conservées dans les artifacts, jamais dans baremes.json')
     args = p.parse_args(argv)
+    if args.mode == 'temoin':
+        return execution_temoin_v20(args)
 
     erreurs, avertissements, analyses, etat_sources = [], [], [], {}
     try:
         etat = charger_etat(args.etat)
     except (ValueError, OSError, json.JSONDecodeError) as erreur:
-        etat = {'version': '19.0', 'archives_traitees': {}, 'derniere_date_jorf': None}
+        etat = {'version': '20.0', 'archives_traitees': {}, 'derniere_date_jorf': None}
         erreurs.append('Fichier d’état illisible : ' + str(erreur))
     etat_initial = json.dumps(etat, sort_keys=True)
+    archives_initiales = sum(len(x) for x in etat.get('archives_traitees', {}).values())
     kali = jorf = bocc = None
     lacunes_jorf = []
     locaux = {'KALI': args.archive_kali_locale, 'JORF': args.archive_jorf_locale,
@@ -906,7 +1167,7 @@ def execution(argv=None) -> int:
                 erreurs.append('Tickets GitHub : ' + str(erreur)[:180])
 
     rapport = {
-        'version': '19.0', 'horodatage_utc': datetime.now(timezone.utc).isoformat(), 'mode': args.mode,
+        'version': '20.0', 'horodatage_utc': datetime.now(timezone.utc).isoformat(), 'mode': args.mode,
         'sources': [SOURCE_KALI, SOURCE_JORF, SOURCE_JORFSIMPLE, SOURCE_BOCC],
         'etat_sources': etat_sources,
         'archives': [{k: a[k] for k in ('archive', 'fichiers_xml_examines', 'fichiers_pdf_examines', 'sections_lisibles') if k in a}
@@ -924,6 +1185,13 @@ def execution(argv=None) -> int:
             'Les archives BOCC étudiées ne constituent pas un historique intégral.',
             'Aucun montant n’est ajouté automatiquement dans baremes.json.',
         ],
+        'suivi_persistant': {
+            'fichier_demande': args.etat,
+            'archives_au_demarrage': archives_initiales,
+            'archives_apres_analyse': sum(len(a) for a in etat.get('archives_traitees', {}).values()),
+            'ecriture_prevue': bool(args.etat and args.mode != 'retroactif' and not erreurs and json.dumps(etat, sort_keys=True) != etat_initial),
+            'confirmation_commit_git': 'à vérifier dans les étapes GitHub Actions',
+        },
         'baremes_modifies': False,
     }
     chemin_rapport = Path(args.rapport)
@@ -932,7 +1200,7 @@ def execution(argv=None) -> int:
         dest = Path(args.etat)
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(json.dumps(etat, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    print('V19 :', len(analyses), 'archives lues ;', len(groupes), 'documents ;', len(nouveaux), 'alertes.')
+    print('V20 :', len(analyses), 'archives lues ;', len(groupes), 'documents ;', len(nouveaux), 'alertes.')
     for nom, temoin in temoins_jorf.items():
         print('Témoin JORF', nom, ':', temoin['etat'])
     if erreurs:

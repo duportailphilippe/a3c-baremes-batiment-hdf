@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Régressions de veille A3C V19 (incluant les acquis V17), sans accès Internet.
+"""Régressions de veille A3C V20 (incluant les acquis V17), sans accès Internet.
 
 Les extraits de chiffres de 2024, 2025, 2026 correspondent aux textes de
 Légifrance ; les enveloppes XML de tests sont synthétiques.
 """
 import io
+import json
 from pathlib import Path
 import tarfile
 import tempfile
@@ -266,7 +267,7 @@ class TestVeilleV19(unittest.TestCase):
                         '--archive-bocc-locale', p3])
                 self.assertEqual(resultat, 0)
                 donnees = json.loads(rapport.read_text(encoding='utf-8'))
-                self.assertEqual(donnees['version'], '19.0')
+                self.assertEqual(donnees['version'], '20.0')
                 self.assertEqual(len(donnees['archives']), 3)
                 self.assertFalse(donnees['baremes_modifies'])
                 self.assertEqual(avant, referentiel.read_bytes())
@@ -362,6 +363,244 @@ class TestRetrospectifEtPersistantV19(unittest.TestCase):
                 self.assertEqual(baremes.read_bytes(), original)
             finally:
                 source.cleanup()
+
+
+class TestControleHistoriqueV20(unittest.TestCase):
+    """Scénarios de régression V20 sur fichiers SYNTHÉTIQUES et flux simulés.
+
+    Leur réussite ne prouve jamais le contenu de l'archive officielle réelle.
+    """
+
+    def setUp(self):
+        self.titre = 'Arrêté du 22 octobre 2026 portant extension d’accords régionaux Hauts-de-France (bâtiment 1596 et 1597)'
+        self.corps = '''Arrêté portant extension d'accords régionaux (Hauts-de-France)
+        des ouvriers du bâtiment (IDCC 1596, 1597).
+        Vu l'accord régional (Hauts-de-France) du 10 juillet 2026 relatif aux salaires ;
+        Vu l'accord régional (Hauts-de-France) du 10 juillet 2026 relatif aux indemnités de petits déplacements ;
+        Article 1 Sont rendues obligatoires les stipulations de l'accord régional
+        (Hauts-de-France) du 10 juillet 2026 relatif aux salaires.
+        Article 3 Sont rendues obligatoires, pour tous les employeurs et salariés
+        compris dans le champ d'application professionnel des conventions collectives
+        nationales des ouvriers du bâtiment, les stipulations de l'accord régional
+        (Hauts-de-France) du 10 juillet 2026 relatif aux indemnités de petits déplacements.
+        Article 5 L'extension prend effet à compter de la publication du présent arrêté.
+        TRST2627911A.'''
+
+    def piece(self, corps=None, ident='JORFTEXT000055037883', date_pub='2026-10-31'):
+        from xml.sax.saxutils import escape
+        corps = self.corps if corps is None else corps
+        return (f'<TEXTE><META><ID>{ident}</ID><DATE_PUBLI>{date_pub}</DATE_PUBLI>'
+                f'<NOR>TRST2627911A</NOR><TITREFULL>{escape(self.titre)}</TITREFULL></META>'
+                f'<CONTENU>{escape(corps)}</CONTENU></TEXTE>').encode('utf-8')
+
+    def archive(self, elements=None):
+        contenu = elements or {'jorf/TEXT/55/JORFTEXT000055037883.xml': self.piece()}
+        dossier, fichier = archive_temporaire(contenu)
+        return dossier, Path(fichier).read_bytes()
+
+    def analyse_bytes(self, donnees, authentifie=False, **kwargs):
+        return v.scanner_stock_jorf_vers_temoins(
+            io.BytesIO(donnees), '2026-10-31', 'archive fictive de tests',
+            authentifie_dila=authentifie, **kwargs)
+
+    def test_selection_archive_globale_jorfsimple(self):
+        index = ('<a href="Freemium_jorf_simple_20261101-140000.tar.gz">ancien</a>'
+                 '<a href="Freemium_jorf_simple_20261108-140000.tar.gz">récent</a>'
+                 '<a href="JORFSIMPLE_20261109-000000.tar.gz">journal</a>')
+        x = v.archive_globale_jorf_simple(index)
+        self.assertEqual(x, v.SOURCE_JORFSIMPLE+'Freemium_jorf_simple_20261108-140000.tar.gz')
+
+    def test_index_avec_fichier_truque_ignore(self):
+        self.assertIsNone(v.archive_globale_jorf_simple('<a href="evil_20261031.tar.gz">z</a>'))
+
+    def test_qualification_article_extension_expresse(self):
+        self.assertTrue(v.confirmation_extension_obligatoire(self.corps, '2026-07-10'))
+
+    def test_ne_confond_pas_visa_et_dispositif(self):
+        t = ('Arrêté portant extension Hauts-de-France ouvriers bâtiment 1596 1597. '
+             'Vu l’accord régional du 10 juillet 2026 relatif aux indemnités de petits déplacements. '
+             'Article 1 Sont rendues obligatoires les stipulations de l’accord régional '
+             'du 10 juillet 2026 relatif aux salaires.')
+        self.assertFalse(v.confirmation_extension_obligatoire(t, '2026-07-10'))
+
+    def test_qualification_document_date_et_sha(self):
+        q = v.qualification_temoin_document(self.piece(), 'JO/JORFTEXT000055037883.xml','2026-10-31')
+        self.assertEqual(q['date_publication_xml'],'2026-10-31')
+        self.assertTrue(q['accord_temoignage_rendu_obligatoire_dans_article'])
+        self.assertEqual(q['identifiant_jorf_detecte'],'JORFTEXT000055037883')
+        self.assertEqual(len(q['empreinte_sha256_xml']),64)
+        self.assertEqual(q['nor_detecte'], 'TRST2627911A')
+
+    def test_date_incorrecte_exclue_meme_si_texte_identique(self):
+        self.assertIsNone(v.qualification_temoin_document(self.piece(date_pub='2026-11-01'), 'jo.xml','2026-10-31'))
+
+    def test_date_texte_sans_metadata_exclue(self):
+        p = self.piece().replace(b'<DATE_PUBLI>2026-10-31</DATE_PUBLI>',b'<PUBLICATION>2026-10-31</PUBLICATION>')
+        self.assertIsNone(v.qualification_temoin_document(p,'jo.xml','2026-10-31'))
+
+    def test_flux_synthetique_trouve_temoignage_dans_article(self):
+        dossier, bytes_zip = self.archive()
+        try:
+            a = self.analyse_bytes(bytes_zip, authentifie=True)
+            self.assertTrue(a['preuve_officielle_retrouvee'])
+            self.assertEqual(a['fichiers_xml_parcourus'],1)
+            self.assertTrue(a['arret_apres_preuve'])
+            self.assertEqual(v.verdict_temoin_v20(a)[0],'preuve_officielle_dila_retrouvee')
+        finally:
+            dossier.cleanup()
+
+    def test_flux_non_officiel_ne_vaut_pas_preuve(self):
+        dossier, bytes_zip = self.archive()
+        try:
+            a = self.analyse_bytes(bytes_zip, authentifie=False)
+            self.assertFalse(a['preuve_officielle_retrouvee'])
+            self.assertEqual(v.verdict_temoin_v20(a)[0],'test_local_non_authentifie')
+        finally:
+            dossier.cleanup()
+
+    def test_test_local_cli_statut_distinct_et_code_non_nul(self):
+        dossier, brut = self.archive()
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d)/'jo.tar.gz'; f.write_bytes(brut)
+            rapport = Path(d)/'rapport.json'
+            etat = Path(d)/'suivi'/'etat_veille.json'
+            etat.parent.mkdir(parents=True)
+            etat.write_text('{"suivi": "non modifié"}', encoding='utf-8')
+            avant = etat.read_bytes()
+            code = v.execution(['--mode','temoin','--archive-jorfsimple-locale',str(f),
+                    '--rapport',str(rapport),'--etat',str(etat),
+                    '--dossier-preuves',str(Path(d)/'preuves')])
+            self.assertEqual(code,2)
+            resultat = json.loads(rapport.read_text())
+            self.assertEqual(resultat['etat_controle'],'test_local_non_authentifie')
+            self.assertFalse(resultat['baremes_modifies'])
+            self.assertEqual(etat.read_bytes(), avant)
+            self.assertTrue((Path(d)/'preuves'/'temoin_jorf_2026-10-31.xml').is_file())
+        dossier.cleanup()
+
+    def test_source_officielle_simulee_dans_cli(self):
+        dossier, contenu = self.archive()
+        with tempfile.TemporaryDirectory() as d:
+            rapport = Path(d)/'rapport.json'
+            with patch.object(v, 'lire_index', return_value='<a href="Freemium_jorf_simple_20261108-140000.tar.gz">x</a>'), \
+                 patch.object(v, 'ouvrir', side_effect=lambda _: io.BytesIO(contenu)):
+                code = v.execution(['--mode','temoin','--rapport',str(rapport),
+                         '--dossier-preuves',str(Path(d)/'preuves')])
+            self.assertEqual(code,0)
+            r = json.loads(rapport.read_text())
+            self.assertEqual(r['etat_controle'],'preuve_officielle_dila_retrouvee')
+            self.assertIn(v.SOURCE_JORFSIMPLE, r['temoin_jorf']['archive_officielle'])
+        dossier.cleanup()
+
+    def test_flux_incomplet_ne_vaut_pas_une_absence(self):
+        dossier, contenu = self.archive()
+        try:
+            a = self.analyse_bytes(contenu[:40], authentifie=True)
+            self.assertEqual(v.verdict_temoin_v20(a)[0],'controle_incomplet')
+            self.assertTrue(a['erreur'])
+        finally:
+            dossier.cleanup()
+
+    def test_archive_complete_sans_temoin_declaree_non_retrouvee(self):
+        dossier, contenu = self.archive({'x.xml': self.piece(date_pub='2026-10-30')})
+        try:
+            a=self.analyse_bytes(contenu, authentifie=True)
+            self.assertEqual(v.verdict_temoin_v20(a)[0], 'temoin_non_retrouve')
+            self.assertTrue(a['archive_parcourue_en_entier'])
+        finally:
+            dossier.cleanup()
+
+    def test_rejet_visa_seul_pas_de_fausse_preuve(self):
+        texte = '''Arrêté portant extension d’accords régionaux Hauts-de-France des ouvriers du bâtiment.
+        Vu l'accord régional du 10 juillet 2026 relatif aux indemnités de petits déplacements.
+        Article 1 Sont rendues obligatoires les stipulations de l'accord du 10 juillet 2026 relatif aux salaires.'''
+        dossier, contenu = self.archive({'JO/JORFTEXT000055037883.xml': self.piece(texte)})
+        try:
+            a=self.analyse_bytes(contenu, authentifie=True)
+            self.assertEqual(v.verdict_temoin_v20(a)[0],'temoin_non_retrouve')
+        finally:
+            dossier.cleanup()
+
+    def test_identifiant_différent_defaut_de_concordance(self):
+        id2='JORFTEXT000055037884'
+        dossier, contenu = self.archive({'JO/'+id2+'.xml':self.piece(ident=id2)})
+        try:
+            a=self.analyse_bytes(contenu, authentifie=True)
+            self.assertEqual(v.verdict_temoin_v20(a)[0],'discordance_a_verifier')
+            self.assertFalse(a['concordance_identifiant_attendu'])
+        finally:
+            dossier.cleanup()
+
+    def test_recherche_ne_depend_pas_de_lidentifiant_jorf_prevu(self):
+        q=v.qualification_temoin_document(self.piece(ident='JORFTEXT000055099999'), 'autre.xml','2026-10-31')
+        self.assertIsNotNone(q)
+        self.assertEqual(q['identifiant_jorf_detecte'],'JORFTEXT000055099999')
+
+    def test_plusieurs_jours_meme_archive(self):
+        dossier, contenu = self.archive({'un.xml': self.piece(date_pub='2026-10-30'),
+                                          'deux.xml': self.piece()})
+        try:
+            a=self.analyse_bytes(contenu, authentifie=True)
+            self.assertEqual(a['fichiers_xml_parcourus'],2)
+            self.assertEqual(a['fichiers_du_jour_examines'],1)
+            self.assertTrue(a['preuve_officielle_retrouvee'])
+        finally:
+            dossier.cleanup()
+
+    def test_preuves_brutes_hash_correspond(self):
+        import hashlib
+        dossier, contenu = self.archive()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                a=self.analyse_bytes(contenu, authentifie=True, dossier_preuves=d)
+                doc=a['documents_candidates_extension'][0]
+                fichier=Path(doc['piece_xml_conservee'])
+                self.assertEqual(hashlib.sha256(fichier.read_bytes()).hexdigest(),doc['empreinte_sha256_xml'])
+        finally:
+            dossier.cleanup()
+
+    def test_rapport_ecrit_meme_en_cas_de_date_invalide(self):
+        with tempfile.TemporaryDirectory() as d:
+            f=Path(d)/'rapport.json'
+            code=v.execution(['--mode','temoin','--date-temoin','erreur','--rapport',str(f)])
+            self.assertEqual(code,1)
+            self.assertEqual(json.loads(f.read_text())['etat_controle'],'controle_incomplet')
+
+    def test_aucun_lien_stock_global_produit_une_erreur_explicite(self):
+        with tempfile.TemporaryDirectory() as d:
+            f=Path(d)/'rapport.json'
+            with patch.object(v,'lire_index',return_value='<html>aucun stock</html>'):
+                self.assertEqual(v.execution(['--mode','temoin','--rapport',str(f)]),1)
+            self.assertTrue(json.loads(f.read_text())['erreurs'])
+
+    def test_limite_compression_refuse_flux_abusif(self):
+        dossier, contenu=self.archive()
+        try:
+            with patch.object(v,'MAX_ARCHIVE_HISTORIQUE_COMPRIMEE', 12):
+                a=self.analyse_bytes(contenu, authentifie=True)
+            self.assertEqual(v.verdict_temoin_v20(a)[0],'controle_incomplet')
+        finally:
+            dossier.cleanup()
+
+    def test_aucun_fichier_est_extrait_sur_disque_depuis_un_chemin_tar(self):
+        dossier, contenu=self.archive({'../../../autre_dossier/JORFTEXT000055037883.xml':self.piece()})
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                a=self.analyse_bytes(contenu, authentifie=True, dossier_preuves=d)
+                self.assertTrue(a['preuve_officielle_retrouvee'])
+                self.assertEqual([x.name for x in Path(d).iterdir()],['temoin_jorf_2026-10-31.xml'])
+            finally:
+                dossier.cleanup()
+
+    def test_arret_apres_preuve_nimplique_pas_exhaustivite(self):
+        dossier, contenu = self.archive({'premier.xml':self.piece(), 'deuxieme.xml':self.piece()})
+        try:
+            a=self.analyse_bytes(contenu, authentifie=True)
+            self.assertTrue(a['arret_apres_preuve'])
+            self.assertFalse(a['archive_parcourue_en_entier'])
+        finally:
+            dossier.cleanup()
+
 
 
 if __name__ == '__main__':
