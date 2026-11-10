@@ -2,14 +2,14 @@ name: Veille officielle des accords Bâtiment Hauts-de-France
 
 on:
   schedule:
-    # Chaque matin : nouvelles archives KALI, JORFSIMPLE (ou JORF) et BOCC.
+    # Contrôle des nouveaux lots KALI, JORFSIMPLE/JORF et BOCC.
     - cron: '23 7 * * *'
-    # Chaque dimanche : contrôle global KALI et fenêtre BOCC élargie.
+    # Le dimanche, comparaison élargie avec le stock KALI.
     - cron: '43 6 * * 0'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Contrôle : quotidien, complet ou retroactif'
+        description: 'quotidien, complet, retroactif ou temoin (JORF du 31/10/2026)'
         required: true
         type: choice
         default: quotidien
@@ -17,9 +17,10 @@ on:
           - quotidien
           - complet
           - retroactif
+          - temoin
 
 permissions:
-  contents: write  # Uniquement suivi/etat_veille.json, jamais baremes.json.
+  contents: write       # Uniquement le suivi des archives, jamais les barèmes.
   issues: write
 
 concurrency:
@@ -28,28 +29,37 @@ concurrency:
 
 jobs:
   surveillance:
-    name: Veille XML officielle KALI / JORF / BOCC
+    name: Veille officielle DILA / preuve historique V20
     runs-on: ubuntu-24.04
-    timeout-minutes: 42
+    # Le mode témoin lit en flux un stock historique JORFSIMPLE (~1,1 Go compressé).
+    # Le même job héberge les modes quotidiens mais cette limite haute ne les oblige
+    # pas à s'exécuter pendant cette durée.
+    timeout-minutes: 155
     steps:
       - name: Récupérer les fichiers du dépôt
         uses: actions/checkout@v4
         with:
           persist-credentials: true
+
       - name: Installer Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Préparer le lecteur PDF du BOCC
+
+      - name: Préparer le lecteur PDF BOCC
+        if: ${{ inputs.mode != 'temoin' }}
         shell: bash
         run: |
           if ! command -v pdftotext >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -qq -y poppler-utils
           fi
-      - name: Effectuer les tests de régression
+
+      - name: Vérifier les 59 tests de régression V20
+        shell: bash
         run: python -m unittest discover -s outils -p 'test_veille_accords.py' -v
-      - name: Examiner les archives officielles
+
+      - name: Contrôler les publications officielles
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -58,44 +68,103 @@ jobs:
           PLANIFICATION: ${{ github.event.schedule }}
           MODE_MANUEL: ${{ inputs.mode }}
         run: |
+          set -euo pipefail
           MODE='quotidien'
           if [[ "$PLANIFICATION" == '43 6 * * 0' ]]; then
             MODE='complet'
           elif [[ "$EVENEMENT" == 'workflow_dispatch' && -n "$MODE_MANUEL" ]]; then
             MODE="$MODE_MANUEL"
           fi
-          echo "Mode A3C V19 : $MODE"
-          if [[ "$MODE" == 'retroactif' ]]; then
-            python outils/veille_accords.py --mode "$MODE" --rapport rapport_veille.json
+          echo "Veille A3C V20 — mode $MODE"
+          if [[ "$MODE" == 'temoin' ]]; then
+            # Cette seule option traite le stock XML historique JORFSIMPLE.
+            # Ni tickets GitHub, ni écriture du suivi, ni modification des barèmes.
+            python -u outils/veille_accords.py --mode temoin \
+              --date-temoin 2026-10-31 \
+              --rapport rapport_veille.json \
+              --dossier-preuves preuves_veille
+          elif [[ "$MODE" == 'retroactif' ]]; then
+            python -u outils/veille_accords.py --mode retroactif \
+              --rapport rapport_veille.json
           else
-            python outils/veille_accords.py --mode "$MODE" \
+            python -u outils/veille_accords.py --mode "$MODE" \
               --rapport rapport_veille.json \
               --etat suivi/etat_veille.json \
               --creer-tickets
           fi
-      - name: Mémoriser les archives déjà examinées
-        # Le mode rétrospectif ne modifie jamais l'état de la veille.
+
+      - name: Conserver et vérifier le suivi GitHub
         if: success()
         shell: bash
         run: |
-          if [[ -f suivi/etat_veille.json ]]; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git add suivi/etat_veille.json
-            if ! git diff --cached --quiet; then
-              git commit -m 'veille: mémoriser les archives officielles examinées [skip ci]'
-              git push origin HEAD:${{ github.ref_name }}
-            else
-              echo 'Aucune nouvelle archive à mémoriser.'
-            fi
-          else
-            echo 'Aucun état à enregistrer (contrôle rétrospectif ou aucune mise à jour).'
+          set -euo pipefail
+          if [[ ! -f suivi/etat_veille.json ]]; then
+            echo 'Aucun état de veille à publier (mode témoin, rétroactif ou absence de nouvel état).'
+            exit 0
           fi
-      - name: Conserver le rapport de veille
+          python -m json.tool suivi/etat_veille.json >/dev/null
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          # Sécurité : ajouter EXCLUSIVEMENT le fichier de suivi, pas baremes.json.
+          git add -- suivi/etat_veille.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'veille: conserver les archives contrôlées V20 [skip ci]'
+            git push origin HEAD:"${{ github.ref_name }}"
+          else
+            echo 'Suivi inchangé ; aucune publication nécessaire.'
+          fi
+          # Read-back : comparaison exacte entre le dépôt distant et le fichier local.
+          git fetch origin "${{ github.ref_name }}"
+          local_hash=$(git hash-object suivi/etat_veille.json)
+          remote_hash=$(git rev-parse "FETCH_HEAD:suivi/etat_veille.json")
+          if [[ "$local_hash" != "$remote_hash" ]]; then
+            echo 'ERREUR : le fichier de suivi distant ne correspond pas à celui du contrôle.' >&2
+            exit 1
+          fi
+          echo "Suivi distant vérifié : $remote_hash"
+
+      - name: Résumé lisible dans GitHub Actions
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json, os
+          p=Path('rapport_veille.json')
+          contenu=['## A3C — Bilan de veille V20', '']
+          if not p.exists():
+              contenu.append('⚠️ Aucun rapport n’a été produit ; consulter le journal du job.')
+          else:
+              r=json.loads(p.read_text(encoding='utf-8'))
+              contenu.append(f"- Mode : **{r.get('mode', 'inconnu')}**")
+              contenu.append(f"- Version : **{r.get('version', 'inconnue')}**")
+              if r.get('mode')=='temoin':
+                  x=r.get('temoin_jorf', {})
+                  contenu.append(f"- Témoin 31 octobre 2026 : **{r.get('etat_controle')}**")
+                  contenu.append(f"- XML parcourus : **{x.get('fichiers_xml_parcourus',0)}**")
+                  contenu.append(f"- Accord 10 juillet 2026 retrouvé dans une clause d’extension : **{x.get('preuve_officielle_retrouvee', False)}**")
+                  contenu.append(f"- Concordance JORF attendue : **{x.get('concordance_identifiant_attendu')}**")
+                  contenu.append('- Le XML témoin est joint aux Artifacts uniquement s’il a été retrouvé.')
+              else:
+                  contenu.append(f"- Documents : **{r.get('nombre_documents_regroupes',0)}**")
+                  contenu.append(f"- Alertes potentielles : **{r.get('nombre_alertes_potentielles',0)}**")
+                  suivi=r.get('suivi_persistant',{})
+                  if suivi:
+                      contenu.append(f"- Archives mémorisées : **{suivi.get('archives_apres_analyse',0)}**")
+              contenu.append(f"- Erreurs : **{len(r.get('erreurs',[]))}**")
+              contenu.append('- Publication de nouveaux barèmes : **aucune (validation juridique nécessaire)**')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a',encoding='utf-8') as f:
+              f.write('\n'.join(contenu)+'\n')
+          PY
+
+      - name: Conserver le rapport, les preuves XML et le suivi
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rapport-a3c-v19-${{ github.run_id }}
-          path: rapport_veille.json
+          name: rapport-a3c-v20-${{ github.run_id }}
+          path: |
+            rapport_veille.json
+            preuves_veille/
+            suivi/etat_veille.json
           if-no-files-found: warn
           retention-days: 60
