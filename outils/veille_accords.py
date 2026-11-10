@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Veille A3C V17 — DILA/KALI et JORF, sans modification de baremes.json.
+"""Veille A3C V18 — sources indépendantes KALI / JORF / BOCC, sans écriture dans baremes.json.
 
-- Quotidien : complément KALI le plus récent + derniers compléments JORF disponibles.
-- Complet / rétroactif : archive KALI globale + derniers JORF (jamais JORF global, 1,6 Go).
+- Quotidien : complément KALI, JORF récents et BOCC récents (surveillance indépendante).
+- Complet : archive KALI globale, JORF et BOCC récents.
+- Rétroactif : contrôle des grilles KALI et tentative de lecture officielle ciblée du JORF 31/10/2026.
 - Regroupe les articles d'un même accord, reconstitue des barèmes seulement si non ambigus.
 - Signale les arrêtés d'extension pour validation juridique.
 - Les montants extraits sont des PROPOSITIONS. Le simulateur n'est jamais mis à jour.
@@ -19,6 +20,9 @@ from html import unescape
 from html.parser import HTMLParser
 import json
 import os
+import shutil
+import subprocess
+import zipfile
 from pathlib import Path
 import re
 import sys
@@ -32,10 +36,16 @@ import xml.etree.ElementTree as ET
 
 SOURCE_KALI = 'https://echanges.dila.gouv.fr/OPENDATA/KALI/'
 SOURCE_JORF = 'https://echanges.dila.gouv.fr/OPENDATA/JORF/'
-AGENT = 'A3C-Veille-Accords/17 (veille juridique; depot GitHub a3c-baremes-batiment-hdf)'
+SOURCE_BOCC = 'https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/'
+TEMOIN_JORF_2026 = 'https://www.legifrance.gouv.fr/jorf/id/JORFTEXT000055037883'
+BOCC_TEMOIN_2026 = 'CCO20260038.complet.taz'
+AGENT = 'A3C-Veille-Accords/18 (veille documentaire; depot GitHub a3c-baremes-batiment-hdf)'
 LIMITE_KALI = 340_000_000
 LIMITE_JORF = 125_000_000  # Les JORF globaux sont volontairement exclus
 LIMITE_XML = 6_000_000
+LIMITE_BOCC = 90_000_000
+LIMITE_PDF = 24_000_000
+LIMITE_TEXTE = 1_000_000
 LIMITE_ALERTES = 12
 DERNIER_ACCORD_CONNU = '2026-07-10'
 # Témoins historiques non utilisés pour publier un barème, seulement pour tester le moteur.
@@ -84,6 +94,101 @@ def archives_disponibles(index: str, famille: str) -> dict[str, object]:
         'quotidiens': [urljoin(base, n) for n in quotidiens[-3:]],
         'global': urljoin(base, globales[-1]) if globales else None,
     }
+
+
+def archives_bocc_disponibles(index: str, limite: int = 4) -> dict[str, object]:
+    """BOCC : classement par date de mise en ligne, pas par numéro du bulletin.
+
+    La DILA peut mettre en ligne un numéro ancien après un numéro plus récent.
+    Les dates proviennent de l'index officiel Apache (approche prudente).
+    """
+    motif = re.compile(
+        r'<a\s+href=["\'](CCO\d{8}\.complet\.taz)["\'][^>]*>[^<]*</a>'
+        r'\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', re.I)
+    entrees = {nom: date for nom, date in motif.findall(index)}
+    lecteur = Liens()
+    lecteur.feed(index)
+    for lien in lecteur.liens:
+        nom = lien.rsplit('/', 1)[-1]
+        if re.fullmatch(r'CCO\d{8}\.complet\.taz', nom, re.I):
+            entrees.setdefault(nom, '')
+    classees = sorted(entrees, key=lambda nom: (entrees[nom], nom))
+    return {
+        'recents': [urljoin(SOURCE_BOCC, nom) for nom in classees[-limite:]],
+        'nombre_total': len(classees),
+        'temoin_2026_present': BOCC_TEMOIN_2026 in entrees,
+        'index_complet_courant': SOURCE_BOCC,
+    }
+
+
+def qualification_texte_jorf(texte: str, titre: str = '') -> str:
+    """Retourne une qualification documentaire, jamais une décision d'opposabilité."""
+    t = normaliser(titre + ' ' + texte)
+    if not ('arrete' in t and ('extension' in t or 'rendues obligatoires' in t)):
+        return 'hors_champ'
+    region = bool(re.search(r'hauts[ -]de[ -]france', t))
+    batiment = ('batiment' in t or bool(re.search(r'\b1596\b|\b1597\b', t)))
+    if not (region and batiment):
+        return 'hors_champ'
+    if 'petits deplacements' in t or 'petit deplacement' in t:
+        return 'extension_deplacements_a_controler'
+    return 'extension_regionale_generale_a_examiner'
+
+
+def est_extension_cible(texte: str, titre: str = '') -> bool:
+    return qualification_texte_jorf(texte, titre) != 'hors_champ'
+
+
+class TexteHTML(HTMLParser):
+    """Extrait le texte visible de pages publiques sans exécuter JavaScript."""
+    def __init__(self):
+        super().__init__()
+        self.parties = []
+        self.cache = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ('script', 'style', 'noscript'):
+            self.cache += 1
+
+    def handle_endtag(self, tag):
+        if tag in ('script', 'style', 'noscript') and self.cache:
+            self.cache -= 1
+
+    def handle_data(self, donnee):
+        if not self.cache:
+            self.parties.append(donnee)
+
+
+def controle_temoin_jorf_2026(lecture=None) -> dict:
+    """Retrouve un arrêté connu sur Légifrance, sans prétendre analyser l'historique JORF.
+
+    L'archive DILA/JORF quotidienne ne propose pas ici un accès historique fiable
+    au 31/10/2026 ; une vérification ciblée de la page officielle est tentée.
+    """
+    resultat = {'reference': 'JORFTEXT000055037883', 'source': TEMOIN_JORF_2026,
+                'accord_reference': '2026-07-10', 'date_publication_attendue': '2026-10-31',
+                'etat': 'source_non_consultee', 'preuve_texte': False}
+    try:
+        if lecture is None:
+            with ouvrir(TEMOIN_JORF_2026) as reponse:
+                brut = reponse.read(1_700_000).decode('utf-8', errors='replace')
+        else:
+            brut = lecture(TEMOIN_JORF_2026)
+        lecteur = TexteHTML()
+        lecteur.feed(brut)
+        t = normaliser(' '.join(lecteur.parties))
+        conditions = (('10 juillet 2026' in t), ('indemnites de petits deplacements' in t),
+                      ('hauts-de-france' in t), ('31 octobre 2026' in t),
+                      ('batiment' in t), ('rendues obligatoires' in t))
+        if all(conditions):
+            resultat.update(etat='confirme_sur_page_legifrance', preuve_texte=True)
+        else:
+            resultat.update(etat='contenu_insuffisant',
+                            champs_absents=[nom for nom, ok in zip(
+                                ['date_accord', 'objet', 'region', 'date_jorf', 'secteur', 'extension'], conditions) if not ok])
+    except (OSError, HTTPError, URLError, ValueError) as erreur:
+        resultat.update(etat='consultation_impossible', avertissement=str(erreur)[:180])
+    return resultat
 
 
 def ouvrir(url: str):
@@ -158,19 +263,6 @@ def est_accord_cible(texte: str, titre: str = '') -> bool:
     travaux_publics_seuls = ('travaux publics' in t and 'batiment' not in t
                             and not re.search(r'\b(?:1596|1597)\b', t))
     return bool(hdf and objet and secteur and not travaux_publics_seuls)
-
-
-def est_extension_cible(texte: str, titre: str = '') -> bool:
-    t = normaliser(texte + ' ' + titre)
-    if 'extension' not in t or ('arrete' not in t and 'sont rendues obligatoires' not in t):
-        return False
-    if 'travaux publics' in t and 'batiment' not in t and not re.search(r'\b(?:1596|1597)\b', t):
-        return False
-    secteur = 'batiment' in t or bool(re.search(r'\b(?:1596|1597)\b', t))
-    region = 'hauts-de-france' in t or 'hauts de france' in t
-    # Les arrêtés regroupent parfois plusieurs accords (salaires + déplacement).
-    # Retenir l'arrêté régional général si les conventions ciblées sont mentionnées.
-    return bool(secteur and region)
 
 
 def euros(nombre: str) -> str | None:
@@ -336,6 +428,7 @@ def analyser_archive(chemin: str, famille: str, url_archive: str) -> dict:
                     if m:
                         g['date_publication_proposee'] = m.group(1)
                 g['objet_extension_a_verifier'] = True
+                g['qualification'] = qualification_texte_jorf(texte, titre)
     resultat = list(groupes.values())
     for g in resultat:
         g['textes_legifrance'] = g['textes_legifrance'][:8]
@@ -343,6 +436,121 @@ def analyser_archive(chemin: str, famille: str, url_archive: str) -> dict:
             g['extraction'] = {'etat': 'non_reconstitue', 'raison': 'Aucun tableau complet et non ambigu repéré',
                                'repas': None, 'transport': None, 'trajet': None, 'date_effet_proposee': None}
     return {'archive': url_archive, 'fichiers_xml_examines': total, 'groupes': resultat}
+
+
+def extraire_pdf(blob: bytes) -> tuple[str, str | None]:
+    """Extraction textuelle, sans OCR ; renvoie explicitement l'indisponibilité."""
+    utilitaire = shutil.which('pdftotext')
+    if not utilitaire:
+        return '', 'Utilitaire pdftotext absent : pages PDF non analysées.'
+    if len(blob) > LIMITE_PDF:
+        return '', 'Fichier PDF trop volumineux.'
+    with tempfile.NamedTemporaryFile(suffix='.pdf') as f:
+        f.write(blob)
+        f.flush()
+        try:
+            resultat = subprocess.run([utilitaire, '-layout', '-enc', 'UTF-8', f.name, '-'],
+                                      capture_output=True, timeout=22, check=False)
+        except (OSError, subprocess.TimeoutExpired) as erreur:
+            return '', 'Conversion PDF impossible : ' + str(erreur)[:100]
+    if resultat.returncode:
+        return '', 'PDF non exploitable en texte (aucune reconnaissance d’image utilisée).'
+    return resultat.stdout.decode('utf-8', errors='replace')[:3_500_000], None
+
+
+def segments_bocc(nom_fichier: str, brut: bytes) -> tuple[list[tuple[str, str]], str | None]:
+    """Divise un bulletin PDF en pages : évite de croiser deux accords différents."""
+    if nom_fichier.lower().endswith('.pdf'):
+        t, erreur = extraire_pdf(brut)
+        if erreur:
+            return [], erreur
+        # Association prudente des pages ; aucune grille BOCC n'est diffusée automatiquement.
+        return [(f'{nom_fichier} — page {num}', page) for num, page in enumerate(t.split('\f'), 1)
+                if page.strip()], None
+    if nom_fichier.lower().endswith(('.xml', '.html', '.htm')):
+        t, titre = donnees_xml(brut)
+        return [(titre or nom_fichier, t)], None
+    if nom_fichier.lower().endswith('.txt'):
+        return [(nom_fichier, brut.decode('utf-8', errors='replace'))], None
+    return [], None
+
+
+def analyser_bocc(chemin: str, url_archive: str) -> dict:
+    """Examine les pièces lisibles d'un BOCC ; tout candidat reste à vérifier."""
+    groupes = {}
+    nombre = pdfs = pieces_lisibles = 0
+    avertissements = []
+
+    def traiter_archive(archive):
+        nonlocal nombre, pdfs, pieces_lisibles
+        for membre in archive:
+            if not membre.isfile():
+                continue
+            nom = membre.name
+            extension = nom.lower().rsplit('.', 1)[-1]
+            if extension not in ('xml', 'txt', 'pdf', 'html', 'htm'):
+                continue
+            nombre += 1
+            if extension == 'pdf':
+                pdfs += 1
+            limite = LIMITE_PDF if extension == 'pdf' else LIMITE_XML
+            if not 0 < membre.size <= limite:
+                avertissements.append('Pièce ignorée pour limite de taille : ' + nom[-90:])
+                continue
+            flux = archive.extractfile(membre)
+            if flux is None:
+                continue
+            sections, erreur = segments_bocc(nom, flux.read(limite + 1))
+            if erreur:
+                avertissements.append(nom[-80:] + ' : ' + erreur)
+            for titre, texte in sections:
+                pieces_lisibles += 1
+                if not est_accord_cible(texte, titre):
+                    continue
+                date = date_accord(texte) or date_accord(titre)
+                cle = ('accord-' + date) if date else 'bocc-' + hashlib.sha256(
+                    (url_archive + nom + titre).encode('utf-8')).hexdigest()[:18]
+                if cle not in groupes:
+                    groupes[cle] = {
+                        'cle': cle, 'famille': 'BOCC', 'date_signature': date,
+                        'titre': titre[:240], 'source_archive': url_archive,
+                        'textes_legifrance': [], 'fichiers_sources': [],
+                        'extraction': {'etat': 'source_bocc_a_verifier',
+                                       'raison': 'Source documentaire BOCC : extraction non certifiée',
+                                       'repas': None, 'transport': None, 'trajet': None,
+                                       'date_effet_proposee': None},
+                        'extrait': texte[:1000], 'qualification': 'accord_deplacements_a_examiner',
+                    }
+                g = groupes[cle]
+                if nom not in g['fichiers_sources'] and len(g['fichiers_sources']) < 9:
+                    g['fichiers_sources'].append(nom)
+    try:
+        # Le suffixe .taz n'indique pas seul le conteneur : tar compressé OU zip.
+        if zipfile.is_zipfile(chemin):
+            with zipfile.ZipFile(chemin) as z:
+                class CompatMembre:
+                    def __init__(self, info):
+                        self.name, self.size = info.filename, info.file_size
+                    def isfile(self):
+                        return not self.name.endswith('/')
+                class CompatArchive:
+                    def __iter__(self):
+                        for info in z.infolist():
+                            yield CompatMembre(info)
+                    def extractfile(self, membre):
+                        import io
+                        return io.BytesIO(z.read(membre.name))
+                traiter_archive(CompatArchive())
+        else:
+            with tarfile.open(chemin, mode='r:*') as a:
+                traiter_archive(a)
+    except (zipfile.BadZipFile, tarfile.TarError, OSError) as erreur:
+        raise ValueError('Archive BOCC illisible : ' + str(erreur)) from erreur
+    if nombre and not pieces_lisibles:
+        avertissements.append('Archive traitée, mais aucune pièce lisible : veille BOCC incomplète.')
+    return {'archive': url_archive, 'fichiers_xml_examines': nombre,
+            'fichiers_pdf_examines': pdfs, 'sections_lisibles': pieces_lisibles,
+            'avertissements': avertissements[:10], 'groupes': list(groupes.values())}
 
 
 def bilan_temoins(groupes: list[dict]) -> dict:
@@ -396,7 +604,7 @@ def tickets_deja_signales(depot: str, jeton: str) -> set[str]:
         if not isinstance(liste, list):
             raise ValueError('Liste des tickets GitHub incorrecte.')
         for ticket in liste:
-            m = re.search(r'\[A3C:(accord-\d{4}-\d{2}-\d{2}|extension-[\w-]+|titre-[0-9a-f]+)\]', ticket.get('title', ''))
+            m = re.search(r'\[A3C:(accord-\d{4}-\d{2}-\d{2}|extension-[\w-]+|bocc-[0-9a-f]+|titre-[0-9a-f]+)\]', ticket.get('title', ''))
             if m:
                 existants.add(m.group(1))
         if len(liste) < 100:
@@ -445,103 +653,179 @@ def creer_tickets(groupes: list[dict], depot: str, jeton: str) -> tuple[int, int
     return nouveaux, doubles
 
 
+def fusionner_groupes(analyses: list[dict]) -> list[dict]:
+    groupes = {}
+    for analyse in analyses:
+        for groupe in analyse['groupes']:
+            cle = (groupe['famille'], groupe['cle'])
+            if cle not in groupes:
+                groupes[cle] = groupe
+            else:
+                precedent = groupes[cle]
+                precedent['textes_legifrance'] = list(dict.fromkeys(
+                    precedent['textes_legifrance'] + groupe['textes_legifrance']))[:8]
+                precedent['fichiers_sources'] = list(dict.fromkeys(
+                    precedent['fichiers_sources'] + groupe['fichiers_sources']))[:12]
+                if (groupe['famille'] == 'KALI'
+                    and precedent['extraction']['etat'] != 'proposition_a_valider'
+                    and groupe['extraction']['etat'] == 'proposition_a_valider'):
+                    precedent['extraction'] = groupe['extraction']
+    return list(groupes.values())
+
+
 def execution(argv=None) -> int:
-    p = argparse.ArgumentParser(description='Veille officielle A3C V17 : KALI + JORF, sans mise à jour automatique des barèmes.')
-    p.add_argument('--mode', choices=['quotidien','complet','retroactif'], default='quotidien')
+    p = argparse.ArgumentParser(description='Veille A3C V18 : KALI, JORF, BOCC ; aucune publication automatique de barème.')
+    p.add_argument('--mode', choices=['quotidien', 'complet', 'retroactif'], default='quotidien')
     p.add_argument('--rapport', default='rapport_veille.json')
     p.add_argument('--creer-tickets', action='store_true')
-    p.add_argument('--archive-kali-locale', help='Test hors ligne : archive KALI')
-    p.add_argument('--archive-jorf-locale', help='Test hors ligne : archive JORF')
+    p.add_argument('--archive-kali-locale')
+    p.add_argument('--archive-jorf-locale')
+    p.add_argument('--archive-bocc-locale')
+    p.add_argument('--sans-temoin-web', action='store_true', help='Désactiver le témoin Légifrance à accès direct')
     args = p.parse_args(argv)
+
     erreurs = []
+    avertissements = []
     analyses = []
-    try:
-        kali = archives_disponibles(lire_index(SOURCE_KALI), 'KALI') if not args.archive_kali_locale else None
-        jorf = (archives_disponibles(lire_index(SOURCE_JORF), 'JORF')
-                if not args.archive_jorf_locale and args.mode != 'retroactif' else None)
-        if args.archive_kali_locale:
-            sources_kali = [(args.archive_kali_locale, True)]
-        elif args.mode in ('complet', 'retroactif'):
-            sources_kali = [(kali['global'], False)] if kali['global'] else []
+    etat_sources = {}
+    temoins_jorf = {}
+
+    kali = jorf = bocc = None
+    if not args.archive_kali_locale:
+        try:
+            kali = archives_disponibles(lire_index(SOURCE_KALI), 'KALI')
+            etat_sources['KALI'] = 'index_accessible'
+        except (OSError, ValueError, HTTPError, URLError) as e:
+            etat_sources['KALI'] = 'index_indisponible'
+            erreurs.append('KALI : index officiel inaccessible : ' + str(e)[:150])
+    if not args.archive_jorf_locale:
+        try:
+            jorf = archives_disponibles(lire_index(SOURCE_JORF), 'JORF')
+            etat_sources['JORF'] = 'index_accessible'
+        except (OSError, ValueError, HTTPError, URLError) as e:
+            etat_sources['JORF'] = 'index_indisponible'
+            erreurs.append('JORF : index officiel inaccessible : ' + str(e)[:150])
+    if not args.archive_bocc_locale:
+        try:
+            bocc = archives_bocc_disponibles(lire_index(SOURCE_BOCC),
+                                              limite=(8 if args.mode != 'quotidien' else 4))
+            etat_sources['BOCC'] = 'index_accessible'
+        except (OSError, ValueError, HTTPError, URLError) as e:
+            etat_sources['BOCC'] = 'index_indisponible'
+            erreurs.append('BOCC : index officiel inaccessible : ' + str(e)[:150])
+
+    kali_sources = ([(args.archive_kali_locale, True)] if args.archive_kali_locale else
+                    ([(kali['global'], False)] if kali and kali['global'] else [])
+                    if args.mode != 'quotidien' else
+                    ([(u, False) for u in kali['quotidiens'][-1:]] if kali else []))
+    # Flux quotidien JORF tournant : on ne présente pas un contrôle historique comme exhaustif.
+    jorf_sources = ([(args.archive_jorf_locale, True)] if args.archive_jorf_locale else
+                    ([(u, False) for u in jorf['quotidiens']] if jorf and args.mode != 'retroactif' else []))
+    bocc_sources = ([(args.archive_bocc_locale, True)] if args.archive_bocc_locale else
+                    ([(u, False) for u in bocc['recents']] if bocc else []))
+
+    for famille, sources in [('KALI', kali_sources), ('JORF', jorf_sources), ('BOCC', bocc_sources)]:
+        if not sources and (famille != 'JORF' or args.mode != 'retroactif'):
+            erreurs.append(f'{famille} : aucune archive exploitable.')
+        if famille == 'JORF' and args.mode == 'retroactif' and not args.archive_jorf_locale:
+            etat_sources['JORF'] = 'historique_non_disponible_via_flux_quotidien'
+        for url, local in sources:
+            fichier = url if local else None
+            try:
+                if not local:
+                    plafond = LIMITE_KALI if famille == 'KALI' else (LIMITE_JORF if famille == 'JORF' else LIMITE_BOCC)
+                    fichier = telecharger(url, plafond)
+                analyse = (analyser_bocc(fichier, url if not local else 'Archive BOCC locale de test')
+                           if famille == 'BOCC' else
+                           analyser_archive(fichier, famille, url if not local else 'Archive locale de test'))
+                analyses.append(analyse)
+                etat_sources[famille] = 'archive_analysee'
+                if (famille == 'BOCC' and analyse.get('fichiers_pdf_examines', 0) > 0
+                        and analyse.get('sections_lisibles', 0) == 0):
+                    erreurs.append('BOCC : des PDF ont été trouvés mais aucune page n’a pu être analysée ; contrôle incomplet.')
+                avertissements += [famille + ' — ' + x for x in analyse.get('avertissements', [])]
+            except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as e:
+                erreurs.append(f'{famille} — {url} : {str(e)[:200]}')
+            finally:
+                if not local and fichier:
+                    Path(fichier).unlink(missing_ok=True)
+
+    if args.mode == 'retroactif' and not args.sans_temoin_web:
+        temoins_jorf['arrete_22_octobre_2026'] = controle_temoin_jorf_2026()
+        if temoins_jorf['arrete_22_octobre_2026']['etat'] != 'confirme_sur_page_legifrance':
+            avertissements.append('Témoin du JORF 31/10/2026 non confirmé en accès direct : '
+                                  + temoins_jorf['arrete_22_octobre_2026']['etat'])
+    if bocc and not bocc['temoin_2026_present']:
+        avertissements.append('BOCC 2026/38 absent de l’index FluxAnneeCourante consulté : '
+                              'cela ne prouve pas une absence de publication sur Légifrance.')
+    if jorf and jorf['quotidiens']:
+        nom_dernier = jorf['quotidiens'][-1].rsplit('/', 1)[-1]
+        m = re.search(r'JORF_(\d{8})-', nom_dernier)
+        if m:
+            try:
+                jour_publication = datetime.strptime(m.group(1), '%Y%m%d').date()
+                age = (datetime.now(timezone.utc).date() - jour_publication).days
+                if age > 7:
+                    avertissements.append(f'Dernière archive JORF âgée de {age} jours : la couverture est potentiellement incomplète.')
+            except ValueError:
+                avertissements.append('Date du dernier complément JORF illisible.')
+    groupes = fusionner_groupes(analyses)
+    nouveaux = candidats_nouveaux(groupes, args.mode)
+    bilan = bilan_temoins(groupes) if args.mode != 'quotidien' else {}
+    if args.mode != 'quotidien' and bilan.get('2026-07-10', {}).get('etat') == 'introuvable':
+        avertissements.append('Accord du 10 juillet 2026 introuvable dans KALI : '
+                              'le témoin d’extension JORF est suivi séparément.')
+
+    rapport = {
+        'version': '18.0', 'horodatage_utc': datetime.now(timezone.utc).isoformat(),
+        'mode': args.mode, 'sources': [SOURCE_KALI, SOURCE_JORF, SOURCE_BOCC],
+        'etat_sources': etat_sources,
+        'archives': [{k: a[k] for k in ('archive', 'fichiers_xml_examines', 'fichiers_pdf_examines', 'sections_lisibles')
+                      if k in a} for a in analyses],
+        'nombre_documents_regroupes': len(groupes),
+        'nombre_alertes_potentielles': len(nouveaux),
+        'controle_retrospectif': bilan,
+        'temoins_jorf': temoins_jorf,
+        'bocc': {'nombre_bulletins_index': bocc['nombre_total'] if bocc else None,
+                 'numero_temoin_2026_38_present': bocc['temoin_2026_present'] if bocc else None,
+                 'portee': 'derniers bulletins par date de dépôt, pas l’intégralité des publications'},
+        'documents': groupes if args.mode != 'quotidien' else nouveaux,
+        'erreurs': erreurs, 'avertissements': list(dict.fromkeys(avertissements)),
+        'limites': [
+            'Absence de résultat ne signifie pas absence d’accord ou d’arrêté nouveau.',
+            'JORF : accès limité aux archives quotidiennes actuellement disponibles, non à tout l’historique.',
+            'BOCC : uniquement les derniers bulletins (pages PDF découpées pour limiter les faux positifs).',
+            'Témoin JORF 2026 : lecture ciblée d’un texte connu et non recherche historique du JORF.',
+            'Validations des dates d’effet, des extensions et de l’opposabilité obligatoires avant diffusion.',
+            'Aucun document, montant ou date n’est ajouté automatiquement à baremes.json.',
+        ],
+        'baremes_modifies': False,
+    }
+    chemin_rapport = Path(args.rapport)
+    chemin_rapport.write_text(json.dumps(rapport, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    print('V18 :', len(analyses), 'archives ;', len(groupes), 'documents ;', len(nouveaux), 'alertes potentielles.')
+    for date, temoin in bilan.items():
+        print('Témoin de grille', date, ':', temoin['etat'])
+    for nom, temoin in temoins_jorf.items():
+        print('Témoin JORF', nom, ':', temoin['etat'])
+    if args.creer_tickets and args.mode != 'retroactif' and nouveaux:
+        depot, jeton = os.getenv('GITHUB_REPOSITORY', ''), os.getenv('GITHUB_TOKEN', '')
+        if not depot or not jeton:
+            erreurs.append('Création des tickets impossible : dépôt GitHub ou jeton absent.')
         else:
-            sources_kali = [(url, False) for url in kali['quotidiens'][-1:]]
-        if args.archive_jorf_locale:
-            sources_jorf = [(args.archive_jorf_locale, True)]
-        elif args.mode == 'retroactif':
-            sources_jorf = []  # 1,6 Go : historique JORF non téléchargé.
-        else:
-            sources_jorf = [(url, False) for url in (jorf or {}).get('quotidiens', [])]
-        if not sources_kali:
-            raise ValueError('Aucune archive KALI disponible.')
-        for famille, sources in [('KALI',sources_kali), ('JORF',sources_jorf)]:
-            for url, local in sources:
-                fichier = url if local else None
-                try:
-                    if not local:
-                        fichier = telecharger(url, LIMITE_KALI if famille == 'KALI' else LIMITE_JORF)
-                    analyses.append(analyser_archive(fichier, famille, url if not local else 'Archive locale de test'))
-                except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as ex:
-                    erreurs.append(f'{famille} — {url} : {str(ex)[:230]}')
-                finally:
-                    if not local and fichier:
-                        Path(fichier).unlink(missing_ok=True)
-        groupes = {}
-        for analyse in analyses:
-            for groupe in analyse['groupes']:
-                if groupe['cle'] not in groupes:
-                    groupes[groupe['cle']] = groupe
-                else:
-                    ancien = groupes[groupe['cle']]
-                    ancien['textes_legifrance'] = list(dict.fromkeys(ancien['textes_legifrance'] + groupe['textes_legifrance']))[:8]
-                    if ancien['famille'] == 'KALI' and ancien['extraction']['etat'] != 'proposition_a_valider' and groupe['extraction']['etat'] == 'proposition_a_valider':
-                        ancien['extraction'] = groupe['extraction']
-        ordonnes = list(groupes.values())
-        alertes = candidats_nouveaux(ordonnes, args.mode)
-        bilan = bilan_temoins(ordonnes) if args.mode != 'quotidien' else {}
-        rapport = {
-            'version': '17.0', 'horodatage_utc': datetime.now(timezone.utc).isoformat(),
-            'mode': args.mode, 'sources': [SOURCE_KALI, SOURCE_JORF],
-            'archives': [{'adresse': a['archive'], 'fichiers_xml_examines': a['fichiers_xml_examines'],
-                          'documents_regroupes': len(a['groupes'])} for a in analyses],
-            'nombre_documents_regroupes': len(ordonnes),
-            'nombre_alertes_potentielles': len(alertes),
-            'controle_retrospectif': bilan,
-            'documents': ordonnes if args.mode != 'quotidien' else alertes,
-            'erreurs': erreurs,
-            'limites': [
-                'Détection non exhaustive, y compris en cas d’absence de résultat.',
-                'JORF : contrôle des dernières archives quotidiennes, pas du stock historique de 1,6 Go.',
-                'Dates d’effet et d’extension à valider séparément ; extraction des grilles jamais opposable automatiquement.',
-                'Aucun accord ni montant n’est ajouté à baremes.json par ce programme.',
-            ],
-            'baremes_modifies': False,
-        }
-        Path(args.rapport).write_text(json.dumps(rapport, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-        print('V17 :', len(analyses), 'archives analysées ;', len(ordonnes), 'groupes de textes ;', len(alertes), 'alertes potentielles.')
-        for cle, info in bilan.items():
-            print('Témoin', cle, ':', info['etat'])
-        if args.creer_tickets and args.mode != 'retroactif' and alertes:
-            depot, jeton = os.getenv('GITHUB_REPOSITORY',''), os.getenv('GITHUB_TOKEN','')
-            if not depot or not jeton:
-                erreurs.append('Création des tickets impossible : dépôt ou jeton GitHub absent.')
-            else:
-                try:
-                    nouveaux, doubles = creer_tickets(alertes, depot, jeton)
-                    print('Tickets créés :', nouveaux, 'déjà présents :', doubles)
-                except (OSError, ValueError, HTTPError, URLError) as ex:
-                    erreurs.append('Tickets GitHub : ' + str(ex))
-        # Réécriture du rapport si erreur survenue pendant la notification.
-        if erreurs:
-            rapport['erreurs'] = erreurs
-            Path(args.rapport).write_text(json.dumps(rapport, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-            for erreur in erreurs:
-                print('ATTENTION :', erreur, file=sys.stderr)
-            return 1  # Ne pas afficher de coche verte lors d'un contrôle incomplet.
-        return 0
-    except (OSError, ValueError, HTTPError, URLError, tarfile.TarError) as ex:
-        print('ÉCHEC DU PROGRAMME :', ex, file=sys.stderr)
+            try:
+                nombre, doublons = creer_tickets(nouveaux, depot, jeton)
+                print('Tickets créés :', nombre, '; déjà signalés :', doublons)
+            except (OSError, ValueError, HTTPError, URLError) as e:
+                erreurs.append('Création des tickets : ' + str(e)[:200])
+    if erreurs:
+        rapport['erreurs'] = erreurs
+        chemin_rapport.write_text(json.dumps(rapport, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+        for e in erreurs:
+            print('ATTENTION :', e, file=sys.stderr)
         return 1
+    return 0
 
 
 if __name__ == '__main__':
-    sys.exit(execution())
+    raise SystemExit(execution())
