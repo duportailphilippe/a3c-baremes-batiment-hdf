@@ -2,24 +2,24 @@ name: Veille officielle des accords Bâtiment Hauts-de-France
 
 on:
   schedule:
-    # Chaque jour : archives KALI/JORF et derniers bulletins BOCC.
+    # Chaque matin : nouvelles archives KALI, JORFSIMPLE (ou JORF) et BOCC.
     - cron: '23 7 * * *'
-    # Le dimanche : archive KALI globale, derniers JORF et fenêtre BOCC élargie.
+    # Chaque dimanche : contrôle global KALI et fenêtre BOCC élargie.
     - cron: '43 6 * * 0'
   workflow_dispatch:
     inputs:
       mode:
-        description: 'Contrôle à lancer : quotidien, complet ou rétroactif'
+        description: 'Contrôle : quotidien, complet ou retroactif'
         required: true
         type: choice
-        default: retroactif
+        default: quotidien
         options:
           - quotidien
           - complet
           - retroactif
 
 permissions:
-  contents: read
+  contents: write  # Uniquement suivi/etat_veille.json, jamais baremes.json.
   issues: write
 
 concurrency:
@@ -28,28 +28,28 @@ concurrency:
 
 jobs:
   surveillance:
-    name: Contrôle indépendant KALI / JORF / BOCC
+    name: Veille XML officielle KALI / JORF / BOCC
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 42
     steps:
-      - name: Récupérer le programme A3C
+      - name: Récupérer les fichiers du dépôt
         uses: actions/checkout@v4
-      - name: Préparer Python 3.12
+        with:
+          persist-credentials: true
+      - name: Installer Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Vérifier le lecteur des documents PDF BOCC
+      - name: Préparer le lecteur PDF du BOCC
         shell: bash
         run: |
-          if command -v pdftotext >/dev/null 2>&1; then
-            echo 'Lecteur PDF déjà disponible.'
-          else
+          if ! command -v pdftotext >/dev/null 2>&1; then
             sudo apt-get update -qq
             sudo apt-get install -qq -y poppler-utils
           fi
-      - name: Exécuter les tests de régression
+      - name: Effectuer les tests de régression
         run: python -m unittest discover -s outils -p 'test_veille_accords.py' -v
-      - name: Examiner les sources officielles indépendantes
+      - name: Examiner les archives officielles
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -64,17 +64,38 @@ jobs:
           elif [[ "$EVENEMENT" == 'workflow_dispatch' && -n "$MODE_MANUEL" ]]; then
             MODE="$MODE_MANUEL"
           fi
-          echo "Mode A3C V18 : $MODE"
+          echo "Mode A3C V19 : $MODE"
           if [[ "$MODE" == 'retroactif' ]]; then
             python outils/veille_accords.py --mode "$MODE" --rapport rapport_veille.json
           else
-            python outils/veille_accords.py --mode "$MODE" --rapport rapport_veille.json --creer-tickets
+            python outils/veille_accords.py --mode "$MODE" \
+              --rapport rapport_veille.json \
+              --etat suivi/etat_veille.json \
+              --creer-tickets
           fi
-      - name: Conserver le rapport de contrôle
+      - name: Mémoriser les archives déjà examinées
+        # Le mode rétrospectif ne modifie jamais l'état de la veille.
+        if: success()
+        shell: bash
+        run: |
+          if [[ -f suivi/etat_veille.json ]]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add suivi/etat_veille.json
+            if ! git diff --cached --quiet; then
+              git commit -m 'veille: mémoriser les archives officielles examinées [skip ci]'
+              git push origin HEAD:${{ github.ref_name }}
+            else
+              echo 'Aucune nouvelle archive à mémoriser.'
+            fi
+          else
+            echo 'Aucun état à enregistrer (contrôle rétrospectif ou aucune mise à jour).'
+          fi
+      - name: Conserver le rapport de veille
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rapport-a3c-v18-${{ github.run_id }}
+          name: rapport-a3c-v19-${{ github.run_id }}
           path: rapport_veille.json
           if-no-files-found: warn
-          retention-days: 45
+          retention-days: 60
