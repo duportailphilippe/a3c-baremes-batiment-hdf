@@ -2,9 +2,9 @@ name: Veille officielle des accords Bâtiment Hauts-de-France
 
 on:
   schedule:
-    # Tous les jours à 07 h 23 UTC : derniers compléments KALI et JORF.
+    # Chaque jour : archives KALI/JORF et derniers bulletins BOCC.
     - cron: '23 7 * * *'
-    # Le dimanche à 06 h 43 UTC : KALI global + derniers JORF.
+    # Le dimanche : archive KALI globale, derniers JORF et fenêtre BOCC élargie.
     - cron: '43 6 * * 0'
   workflow_dispatch:
     inputs:
@@ -28,19 +28,28 @@ concurrency:
 
 jobs:
   surveillance:
-    name: Contrôle DILA / KALI / JORF
+    name: Contrôle indépendant KALI / JORF / BOCC
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - name: Récupérer le programme A3C
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
       - name: Préparer Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Vérifier le lecteur des documents PDF BOCC
+        shell: bash
+        run: |
+          if command -v pdftotext >/dev/null 2>&1; then
+            echo 'Lecteur PDF déjà disponible.'
+          else
+            sudo apt-get update -qq
+            sudo apt-get install -qq -y poppler-utils
+          fi
       - name: Exécuter les tests de régression
         run: python -m unittest discover -s outils -p 'test_veille_accords.py' -v
-      - name: Examiner les publications officielles
+      - name: Examiner les sources officielles indépendantes
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -55,18 +64,17 @@ jobs:
           elif [[ "$EVENEMENT" == 'workflow_dispatch' && -n "$MODE_MANUEL" ]]; then
             MODE="$MODE_MANUEL"
           fi
-          echo "Mode A3C V17 : $MODE"
+          echo "Mode A3C V18 : $MODE"
           if [[ "$MODE" == 'retroactif' ]]; then
-            # Aucun ticket historique ; les archives servent à la validation.
             python outils/veille_accords.py --mode "$MODE" --rapport rapport_veille.json
           else
             python outils/veille_accords.py --mode "$MODE" --rapport rapport_veille.json --creer-tickets
           fi
-      - name: Conserver le rapport d'audit
+      - name: Conserver le rapport de contrôle
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v4
         with:
-          name: rapport-a3c-v17-${{ github.run_id }}
+          name: rapport-a3c-v18-${{ github.run_id }}
           path: rapport_veille.json
           if-no-files-found: warn
           retention-days: 45
