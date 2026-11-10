@@ -1,0 +1,15 @@
+{
+  "format": "A3C-BTP-HDF-BAREMES-1",
+  "territory": "Hauts-de-France",
+  "idcc": [
+    1596,
+    1597
+  ],
+  "publisher": "A3C-VALIDATED",
+  "validation": "JURIDIQUEMENT_CONTROLE",
+  "release": "1.0.0",
+  "lastEmbeddedBar": "bat2026sep",
+  "referenceLegal": "https://www.legifrance.gouv.fr/jorf/id/JORFTEXT000055037883",
+  "note": "Version initiale sans nouvel accord ajouté. Les barèmes 2024-2026 sont intégrés au simulateur local. Ne publier des montants ultérieurs qu’après contrôle juridique.",
+  "records": []
+}
