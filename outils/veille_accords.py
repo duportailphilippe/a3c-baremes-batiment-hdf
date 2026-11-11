@@ -1101,6 +1101,16 @@ def execution(argv=None) -> int:
         jorf_sources = choisir(famille_jorf, adresses_jorf)
     bocc_sources = ([(args.archive_bocc_locale, True)] if args.archive_bocc_locale else
                     choisir('BOCC', bocc['recents']) if bocc else [])
+    # BOCC : une indisponibilité temporaire de Poppler ne doit pas bloquer KALI/JORF.
+    # Ne jamais marquer une archive BOCC comme examinée sans lecteur PDF.
+    if bocc_sources and not shutil.which('pdftotext'):
+        avertissements.append(
+            'SURVEILLANCE PARTIELLE : pdftotext indisponible ; '
+            'aucune archive BOCC analysée ou mémorisée lors de cette exécution. '
+            'KALI et JORF/JORFSIMPLE restent surveillés. '
+            'Relancer le contrôle BOCC après rétablissement du lecteur PDF.')
+        etat_sources['BOCC'] = 'suspendu_lecteur_pdf_indisponible'
+        bocc_sources = []
     # On ne confond pas « aucune nouvelle archive » et « source en erreur ».
     for famille, sources in [('KALI', kali_sources), (famille_jorf, jorf_sources), ('BOCC', bocc_sources)]:
         if not sources:
