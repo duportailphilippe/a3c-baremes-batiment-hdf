@@ -46,13 +46,36 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Préparer le lecteur PDF BOCC
+      - name: Préparer le lecteur PDF BOCC (sans bloquer KALI/JORF)
         if: ${{ inputs.mode != 'temoin' }}
         shell: bash
         run: |
-          if ! command -v pdftotext >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -qq -y poppler-utils
+          set -uo pipefail
+          if command -v pdftotext >/dev/null 2>&1; then
+            echo 'Lecteur PDF BOCC déjà présent.'
+            exit 0
+          fi
+          # Les dépôts Ubuntu peuvent subir une panne DNS temporaire.
+          # Deux tentatives courtes suffisent ; la veille XML doit continuer.
+          for tentative in 1 2; do
+            echo "Installation de Poppler : tentative $tentative/2"
+            if timeout 65s sudo apt-get update -qq \
+              -o Acquire::Retries=1 \
+              -o Acquire::http::Timeout=12 \
+              -o Acquire::https::Timeout=12 && \
+               timeout 65s sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq poppler-utils \
+              -o Acquire::Retries=1 \
+              -o Acquire::http::Timeout=12 \
+              -o Acquire::https::Timeout=12; then
+              break
+            fi
+            echo "::warning::Téléchargement Ubuntu impossible (tentative $tentative)."
+            sleep 3
+          done
+          if command -v pdftotext >/dev/null 2>&1; then
+            echo 'Lecteur BOCC opérationnel.'
+          else
+            echo '::warning::BOCC suspendu faute de lecteur PDF ; KALI et JORF seront contrôlés. Les archives BOCC ne seront pas marquées traitées.'
           fi
 
       - name: Vérifier les 59 tests de régression V20
