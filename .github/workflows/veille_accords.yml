@@ -78,7 +78,7 @@ jobs:
             echo '::warning::BOCC suspendu faute de lecteur PDF ; KALI et JORF seront contrôlés. Les archives BOCC ne seront pas marquées traitées.'
           fi
 
-      - name: Vérifier les 59 tests de régression V20
+      - name: Vérifier les tests de régression V20 (dont BOCC sans lecteur PDF)
         shell: bash
         run: python -m unittest discover -s outils -p 'test_veille_accords.py' -v
 
