@@ -1103,7 +1103,10 @@ def execution(argv=None) -> int:
                     choisir('BOCC', bocc['recents']) if bocc else [])
     # BOCC : une indisponibilité temporaire de Poppler ne doit pas bloquer KALI/JORF.
     # Ne jamais marquer une archive BOCC comme examinée sans lecteur PDF.
-    if bocc_sources and not shutil.which('pdftotext'):
+    # Le jeu de tests BOCC peut être constitué uniquement de XML : Poppler
+    # n'est alors pas nécessaire. Pour les archives distantes réelles,
+    # une indisponibilité de pdftotext suspend le traitement BOCC.
+    if bocc_sources and not args.archive_bocc_locale and not shutil.which('pdftotext'):
         avertissements.append(
             'SURVEILLANCE PARTIELLE : pdftotext indisponible ; '
             'aucune archive BOCC analysée ou mémorisée lors de cette exécution. '
@@ -1124,6 +1127,11 @@ def execution(argv=None) -> int:
                 analyse = (analyser_bocc(fichier, url if not local else 'Archive BOCC locale de test')
                            if famille == 'BOCC' else
                            analyser_archive(fichier, famille, url if not local else 'Archive XML locale de test'))
+                # Même dans un essai local, une archive BOCC qui contient des PDF
+                # ne doit jamais être comptée comme analysée si le lecteur manque.
+                if (famille == 'BOCC' and analyse.get('fichiers_pdf_examines', 0)
+                        and not shutil.which('pdftotext')):
+                    raise ValueError('Archive BOCC incomplète : PDF présents mais lecteur pdftotext indisponible ; lot non mémorisé.')
                 analyses.append(analyse)
                 etat_sources[famille] = 'archive_analysee'
                 if famille == 'BOCC' and analyse.get('fichiers_pdf_examines', 0) and not analyse.get('sections_lisibles', 0):

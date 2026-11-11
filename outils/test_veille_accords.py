@@ -277,6 +277,79 @@ class TestVeilleV19(unittest.TestCase):
             a1.cleanup(); a2.cleanup(); a3.cleanup()
 
 
+
+class TestRegressionBOCCSansPoppler(unittest.TestCase):
+    """Régression du 11/11/2026 : un lecteur PDF absent ne doit pas
+    écarter un jeu d'essai XML-only ou bloquer la veille quotidienne.
+    """
+
+    def test_trois_archives_xml_locales_sans_lecteur_pdf(self):
+        a1, p1 = archive_temporaire({'k.xml': xml(
+            'Hauts-de-France Accord du 1er décembre 2025 relatif aux indemnités de petits déplacements',
+            GRILLE_2026, 'KALIARTI000053973298')})
+        a2, p2 = archive_temporaire({'j.xml': xml(
+            'Arrêté du 22 octobre 2026 portant extension d’accords régionaux Hauts-de-France',
+            JORF, 'JORFTEXT000055037883')})
+        a3, p3 = archive_temporaire({'b.xml': xml(
+            'Hauts-de-France Accord du 10 juillet 2026 relatif aux indemnités de petits déplacements',
+            GRILLE_JUILLET, 'BOCC')})
+        try:
+            with tempfile.TemporaryDirectory() as dossier:
+                rapport = Path(dossier) / 'rapport.json'
+                with patch.object(v.shutil, 'which', return_value=None):
+                    statut = v.execution(['--mode', 'retroactif', '--rapport', str(rapport),
+                                          '--archive-kali-locale', p1,
+                                          '--archive-jorf-locale', p2,
+                                          '--archive-bocc-locale', p3])
+                donnees = json.loads(rapport.read_text(encoding='utf-8'))
+                self.assertEqual(statut, 0)
+                self.assertEqual(len(donnees['archives']), 3)
+                self.assertTrue(any(g['famille'] == 'BOCC' for g in donnees['documents']))
+                self.assertFalse(donnees['baremes_modifies'])
+        finally:
+            a1.cleanup(); a2.cleanup(); a3.cleanup()
+
+    def test_bocc_distant_suspendu_et_non_memorise_si_pdf_absent(self):
+        index_bocc = '<a href="CCO20260036.complet.taz">x</a> 2026-11-10 08:00'
+        def lire_index_fictif(url):
+            return index_bocc if url == v.SOURCE_BOCC else ''
+        with tempfile.TemporaryDirectory() as dossier:
+            rapport = Path(dossier) / 'rapport.json'
+            etat = Path(dossier) / 'etat.json'
+            with patch.object(v.shutil, 'which', return_value=None), \
+                 patch.object(v, 'lire_index', side_effect=lire_index_fictif), \
+                 patch.object(v, 'telecharger') as telecharger:
+                statut = v.execution(['--mode', 'quotidien', '--rapport', str(rapport),
+                                      '--etat', str(etat)])
+            donnees = json.loads(rapport.read_text(encoding='utf-8'))
+            self.assertEqual(statut, 0)
+            self.assertEqual(donnees['etat_sources']['BOCC'], 'suspendu_lecteur_pdf_indisponible')
+            self.assertEqual(donnees['archives'], [])
+            self.assertTrue(any('SURVEILLANCE PARTIELLE' in x for x in donnees['avertissements']))
+            self.assertFalse(etat.exists())
+            telecharger.assert_not_called()
+
+    def test_bocc_local_avec_pdf_sans_lecteur_est_signale_incomplet(self):
+        a1, chemin = archive_temporaire({
+            'b.xml': xml('Hauts-de-France Accord du 10 juillet 2026 relatif aux indemnités de petits déplacements',
+                         GRILLE_JUILLET, 'BOCC'),
+            'b.pdf': b'%PDF-1.4\n% fichier de test\n',
+        })
+        try:
+            # Les index KALI/JORF sont fictifs : aucune consultation externe.
+            with tempfile.TemporaryDirectory() as dossier:
+                rapport = Path(dossier) / 'rapport.json'
+                with patch.object(v.shutil, 'which', return_value=None), \
+                     patch.object(v, 'lire_index', return_value=''):
+                    statut = v.execution(['--mode', 'retroactif', '--rapport', str(rapport),
+                                          '--archive-bocc-locale', chemin])
+                donnees = json.loads(rapport.read_text(encoding='utf-8'))
+                self.assertEqual(statut, 1)
+                self.assertTrue(any('PDF présents' in x for x in donnees['erreurs']))
+                self.assertFalse(any(a['archive'].startswith('Archive BOCC locale') for a in donnees['archives']))
+        finally:
+            a1.cleanup()
+
 class TestRetrospectifEtPersistantV19(unittest.TestCase):
     def test_index_jorfsimple_et_exclusion_stock_massif(self):
         html = ('<a href="Freemium_jorf_simple_20261108-140000.tar.gz">stock</a>'
