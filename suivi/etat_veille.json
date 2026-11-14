@@ -4,7 +4,8 @@
     "KALI": [
       "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261109-212854.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261110-213159.tar.gz",
-      "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261112-210355.tar.gz"
+      "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261112-210355.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261113-215108.tar.gz"
     ],
     "JORFSIMPLE": [
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261108-210452.tar.gz",
@@ -14,7 +15,9 @@
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261111-044354.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261111-211545.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261112-210355.tar.gz",
-      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261113-003226.tar.gz"
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261113-003226.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261113-215108.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261114-015814.tar.gz"
     ],
     "BOCC": [
       "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260032.complet.taz",
@@ -23,5 +26,5 @@
       "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260036.complet.taz"
     ]
   },
-  "derniere_date_jorf": "2026-11-13"
+  "derniere_date_jorf": "2026-11-14"
 }
