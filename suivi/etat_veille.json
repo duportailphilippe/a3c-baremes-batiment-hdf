@@ -7,7 +7,8 @@
       "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261112-210355.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261113-215108.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/KALI/Freemium_kali_global_20261108-140000.tar.gz",
-      "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261116-212357.tar.gz"
+      "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261116-212357.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/KALI/KALI_20261117-212708.tar.gz"
     ],
     "JORFSIMPLE": [
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261108-210452.tar.gz",
@@ -25,7 +26,9 @@
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261115-205552.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261116-104909.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261116-212357.tar.gz",
-      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261117-014236.tar.gz"
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261117-014236.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261117-212708.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261118-002608.tar.gz"
     ],
     "BOCC": [
       "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260032.complet.taz",
@@ -35,8 +38,9 @@
       "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260029.complet.taz",
       "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260030.complet.taz",
       "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260028.complet.taz",
-      "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260031.complet.taz"
+      "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260031.complet.taz",
+      "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260033.complet.taz"
     ]
   },
-  "derniere_date_jorf": "2026-11-17"
+  "derniere_date_jorf": "2026-11-18"
 }
