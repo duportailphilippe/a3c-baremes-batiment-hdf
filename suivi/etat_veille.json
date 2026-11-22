@@ -37,7 +37,9 @@
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261119-214726.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261120-004838.tar.gz",
       "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261120-222218.tar.gz",
-      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261121-010907.tar.gz"
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261121-010907.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261121-212437.tar.gz",
+      "https://echanges.dila.gouv.fr/OPENDATA/JORFSIMPLE/JORFSIMPLE_20261122-002519.tar.gz"
     ],
     "BOCC": [
       "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260032.complet.taz",
@@ -52,5 +54,5 @@
       "https://echanges.dila.gouv.fr/OPENDATA/BOCC/FluxAnneeCourante/CCO20260037.complet.taz"
     ]
   },
-  "derniere_date_jorf": "2026-11-21"
+  "derniere_date_jorf": "2026-11-22"
 }
